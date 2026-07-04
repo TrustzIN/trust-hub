@@ -292,10 +292,18 @@ local function registerTeleportReload()
     pcall(function()
         queue_on_teleport(([[
             pcall(function() writefile(%q, "1") end)
+            -- A truncated/corrupted HTTP body still counts as a "successful"
+            -- HttpGet (ok=true) — that only failed at loadstring() with
+            -- "bytecode corrupted", past this local fallback entirely since
+            -- it only triggered on the fetch itself failing. Wrap the
+            -- compile-and-run in its own pcall so a bad download still falls
+            -- through to the local copy instead of just erroring out.
             local ok, src = pcall(function() return game:HttpGet(%q) end)
+            local ran = false
             if ok and src and #src > 0 then
-                loadstring(src)()
-            elseif readfile and isfile and isfile("Trust_HUB.lua") then
+                ran = pcall(function() loadstring(src)() end)
+            end
+            if not ran and readfile and isfile and isfile("Trust_HUB.lua") then
                 loadstring(readfile("Trust_HUB.lua"))()
             end
         ]]):format(TELEPORT_MARKER_FILE, REMOTE_SCRIPT_URL))
