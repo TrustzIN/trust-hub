@@ -963,6 +963,22 @@ local function farmLoop()
             end
         end
         checkReload()
+        -- Blade fully broken → do NOT keep slashing. The game's reload flow
+        -- (Modules.Core.ODMG t2.Reload) refuses to run while the client is
+        -- mid-slash/attacking, and the farm loop otherwise fires comboSlash
+        -- every tick (no damage at 0 durability, but it keeps the client in
+        -- the slash state), so the reload could never land — the blade just
+        -- sat empty. Hover in place and skip this tick's attack until the
+        -- segments come back.
+        if CFG.AutoReload then
+            local segs = countIntactSegments()
+            if segs ~= nil and segs <= 0 then
+                hrp.AssemblyLinearVelocity = Vector3.new(0, 5, 0)
+                ST.status = "Reloading blades"
+                task.wait(0.1)
+                continue
+            end
+        end
         titansFolder = workspace:FindFirstChild("Titans") or titansFolder
         local reqCount = CFG.MultiTarget and CFG.MultiTargetN or 1
         local napes = getValidNapes(reqCount)
