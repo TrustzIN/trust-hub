@@ -813,10 +813,23 @@ local function checkReload()
             reloadInProgress = false
             return
         end
-        -- Have reserves: single swap. Confirmed the game's own reload handler
-        -- (Modules.Core.ODMG:274) calls exactly this and nothing else — no VIM
-        -- keypress, which is what was causing the double fire.
-        pcall(function() GET:InvokeServer("Blades", "Reload") end)
+        -- Have reserves: swap to a fresh set. The reliable trigger is the R
+        -- keypress — it drives the game's OWN complete reload flow (input
+        -- handler -> ODMG -> its internal GET Blades/Reload + the client swap).
+        -- Firing our own GET on TOP of that was the double-swap that wasted a
+        -- reserve. But the keypress alone is occasionally dropped, so only if
+        -- the blade is STILL broken a moment later do we fire the direct GET
+        -- as a fallback — reliable, and it never double-swaps in the normal
+        -- case where the keypress worked.
+        pcall(function()
+            VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+            task.wait(0.05)
+            VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+        end)
+        task.wait(0.25)
+        if (countIntactSegments() or 0) == 0 then
+            pcall(function() GET:InvokeServer("Blades", "Reload") end)
+        end
         reloadInProgress = false
     end)
 end
