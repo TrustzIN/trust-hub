@@ -886,10 +886,26 @@ local function updateESP()
         end
     end
 end
-local function espLoop()
+-- Combined 0.5s auxiliary loop: ESP refresh + cutscene skip. These were two
+-- separate 0.5s threads doing independent low-frequency work — merged into one
+-- to cut a spawned coroutine (fewer parallel tasks = less pressure on the
+-- executor's bytecode-patch watcher, which is what's been auto-closing Xeno).
+local function auxLoop()
     while ST.running do
         task.wait(0.5)
         updateESP()
+        if CFG.AutoSkip then
+            local pg = LP:FindFirstChild("PlayerGui")
+            local iface = pg and pg:FindFirstChild("Interface")
+            local skip = iface and iface:FindFirstChild("Skip")
+            if skip and skip.Visible then
+                pcall(function()
+                    VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                    task.wait(0.05)
+                    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                end)
+            end
+        end
     end
     clearESP()
 end
@@ -946,6 +962,7 @@ local function farmLoop()
             napes = {} -- let timer run out with 1 titan left
         end
         if #napes > 0 then
+            ST.status = "Farming titans"
             if CFG.TitanMastery and isShifted then
                 local titanModel = napes[1]
                 while titanModel and titanModel.Parent ~= titansFolder do
@@ -998,6 +1015,7 @@ local function farmLoop()
                 end
             end
         else
+            ST.status = "Waiting for titans"
             hrp.AssemblyLinearVelocity = Vector3.new(0, 5, 0)
         end
     end
@@ -1073,6 +1091,7 @@ local function lobbyLoop()
             end
             ST.stayedInLobby = true -- cleared below once we leave the lobby
             local difficulty = useAutoCap and diffOrderHardToEasy[ST.autoDiffIdx] or CFG.Difficulty
+            ST.status = "Starting mission (" .. tostring(difficulty) .. ")"
             if CFG.StartDelay > 0 then
                 showCountdown(CFG.StartDelay, "Starting Mission")
             end
@@ -1144,8 +1163,10 @@ local function lobbyLoop()
                 -- No GUI interaction needed at all — these are the exact
                 -- calls the button's own click handler makes.
                 if wantLeave then
+                    ST.status = "Returning to lobby"
                     pcall(function() POST:FireServer("Functions", "Teleport") end)
                 else
+                    ST.status = "Retrying mission"
                     local ok, err = pcall(function() return GET:InvokeServer("Functions", "Retry", "Add") end)
                     if not ok then
                         warn("[Trust-HUB] Functions/Retry/Add failed: " .. tostring(err))
@@ -1170,22 +1191,6 @@ end
 -- TextButton/ImageButton named "cutscene"/"cinematic" with Activated to fire,
 -- which never existed here — that's why even a manual click never worked,
 -- there was nothing to click.
-local function skipLoop()
-    while ST.running do
-        task.wait(0.5)
-        if not CFG.AutoSkip then continue end
-        local pg = LP:FindFirstChild("PlayerGui")
-        local iface = pg and pg:FindFirstChild("Interface")
-        local skip = iface and iface:FindFirstChild("Skip")
-        if skip and skip.Visible then
-            pcall(function()
-                VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                task.wait(0.05)
-                VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-            end)
-        end
-    end
-end
 -- ══════════════════════════════════════════════════════════
 -- [15] AUTO-UPGRADE + SKILL TREE (v3.1 RamenHub integration)
 -- ══════════════════════════════════════════════════════════
@@ -1232,6 +1237,7 @@ local BLADE_UPGRADES = {"ODM_Damage","ODM_Gas","ODM_Speed","ODM_Range","ODM_Cont
 local SPEAR_UPGRADES = {"TS_Damage","TS_Gas","TS_Speed","TS_Range","TS_Control","Crit_Damage","Crit_Chance","Blast_Radius"}
 upgradeAllGear = function()
     if not isInLobby() then return false end
+    ST.status = "Upgrading gear"
     -- Try the last-known weapon's list first; if the server rejects it (nil),
     -- the other weapon is equipped — try that and remember it.
     local order = (ST.weaponType == "Spears")
@@ -1316,6 +1322,7 @@ local function readMissionKillsText()
     return slay and slay.Text or nil -- e.g. "Slay Titans [10/44]"
 end
 local statsPanel
+local ACCENT = Color3.fromRGB(103, 89, 179) -- Tokyo Night accent, shared
 local function buildStatsPanel()
     local pg = LP:FindFirstChild("PlayerGui")
     if not pg then return end
@@ -1327,39 +1334,91 @@ local function buildStatsPanel()
     sg.IgnoreGuiInset = true
     sg.Parent = pg
 
+    local labels = { "Status", "Session", "Kills (mission)", "Missions", "Gold earned", "Gold/Hour" }
+    local TITLE_H, ROW_H = 24, 20
+    local bodyH = #labels * ROW_H + 6
+    local fullH = TITLE_H + bodyH
+
     local frame = Instance.new("Frame", sg)
-    frame.Size = UDim2.new(0, 220, 0, 128)
-    frame.Position = UDim2.new(1, -232, 0, 90) -- top-right, clear of the bottom-left avatar/level card
+    frame.Size = UDim2.new(0, 230, 0, fullH)
+    frame.Position = UDim2.new(1, -242, 0, 90)
     frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
     frame.BackgroundTransparency = 0.25
     frame.BorderSizePixel = 0
+    frame.Active = true
     Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
     local stroke = Instance.new("UIStroke", frame)
-    stroke.Color = Color3.fromRGB(103, 89, 179) -- matches the Tokyo Night accent
+    stroke.Color = ACCENT
     stroke.Thickness = 1
 
-    local title = Instance.new("TextLabel", frame)
-    title.BackgroundTransparency = 1
-    title.Size = UDim2.new(1, 0, 0, 22)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 14
-    title.TextColor3 = Color3.fromRGB(200, 190, 255)
-    title.Text = "  TRUST-HUB"
+    -- Title bar doubles as the drag handle.
+    local titleBar = Instance.new("TextButton", frame)
+    titleBar.Size = UDim2.new(1, 0, 0, TITLE_H)
+    titleBar.BackgroundTransparency = 1
+    titleBar.AutoButtonColor = false
+    titleBar.Text = "  TRUST-HUB"
+    titleBar.Font = Enum.Font.GothamBold
+    titleBar.TextSize = 14
+    titleBar.TextXAlignment = Enum.TextXAlignment.Left
+    titleBar.TextColor3 = Color3.fromRGB(200, 190, 255)
+
+    -- Minimize button collapses to just the title bar.
+    local minBtn = Instance.new("TextButton", frame)
+    minBtn.Size = UDim2.new(0, 24, 0, TITLE_H)
+    minBtn.Position = UDim2.new(1, -26, 0, 0)
+    minBtn.BackgroundTransparency = 1
+    minBtn.Text = "–"
+    minBtn.Font = Enum.Font.GothamBold
+    minBtn.TextSize = 18
+    minBtn.TextColor3 = Color3.fromRGB(200, 190, 255)
+
+    local body = Instance.new("Frame", frame)
+    body.Size = UDim2.new(1, 0, 0, bodyH)
+    body.Position = UDim2.new(0, 0, 0, TITLE_H)
+    body.BackgroundTransparency = 1
 
     local rows = {}
-    local labels = { "Session", "Kills (mission)", "Missions", "Gold earned", "Gold/Hour" }
     for i, label in ipairs(labels) do
-        local row = Instance.new("TextLabel", frame)
+        local row = Instance.new("TextLabel", body)
         row.BackgroundTransparency = 1
         row.Size = UDim2.new(1, -16, 0, 18)
-        row.Position = UDim2.new(0, 8, 0, 22 + (i - 1) * 20)
+        row.Position = UDim2.new(0, 8, 0, (i - 1) * ROW_H)
         row.Font = Enum.Font.Gotham
         row.TextSize = 13
         row.TextXAlignment = Enum.TextXAlignment.Left
-        row.TextColor3 = Color3.fromRGB(230, 230, 230)
+        row.TextColor3 = (label == "Status") and Color3.fromRGB(150, 220, 150) or Color3.fromRGB(230, 230, 230)
         row.Text = label .. ": --"
         rows[label] = row
     end
+
+    local minimized = false
+    minBtn.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        body.Visible = not minimized
+        frame.Size = UDim2.new(0, 230, 0, minimized and TITLE_H or fullH)
+        minBtn.Text = minimized and "+" or "–"
+    end)
+
+    -- Drag: standard UDim2-offset drag anchored to where the grab started.
+    local dragging, dragStart, startPos
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end)
+    titleBar.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    track(UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end))
 
     statsPanel = { Gui = sg, Rows = rows }
 end
@@ -1389,6 +1448,8 @@ track(RunService.Heartbeat:Connect(function()
     local now = tick()
     if now - lastStatsUpdate < 1 then return end
     lastStatsUpdate = now
+
+    statsPanel.Rows["Status"].Text = "Status: " .. (ST.status or "Idle")
 
     -- Real wall-clock elapsed (survives hops) — not tick(), which is per-Lua
     -- state and resets to ~0 every reload.
@@ -1527,9 +1588,8 @@ local function masterStart()
     end
     trackThread(farmLoop)
     trackThread(lobbyLoop)
-    trackThread(skipLoop)
     trackThread(upgradeLoop)
-    trackThread(espLoop)
+    trackThread(auxLoop) -- ESP + cutscene skip merged
     -- Ban-attribute clearing already happens reactively via the
     -- AttributeChanged connection set up in [2]; a second 0.5s polling loop
     -- doing the exact same clear on the exact same attribute list was pure
@@ -1564,17 +1624,18 @@ local Window = Library:CreateWindow({
 -- UnlockMouseWhileOpen handling and usually winning it during combat. Snap it
 -- back the instant it changes while our menu is open, instead of fighting it
 -- once per Toggle call.
+-- Both cursor fixes are now purely reactive (property-changed), not a
+-- per-frame Heartbeat: snap MouseBehavior back to Default and re-show the
+-- icon only when the game actually changes them while our menu is open. The
+-- old Heartbeat variant re-checked every single frame for the same effect.
 track(UIS:GetPropertyChangedSignal("MouseBehavior"):Connect(function()
     if Library.Toggled and UIS.MouseBehavior ~= Enum.MouseBehavior.Default then
         UIS.MouseBehavior = Enum.MouseBehavior.Default
     end
 end))
-track(RunService.Heartbeat:Connect(function()
-    if Library.Toggled then
+track(UIS:GetPropertyChangedSignal("MouseIconEnabled"):Connect(function()
+    if Library.Toggled and not UIS.MouseIconEnabled then
         UIS.MouseIconEnabled = true
-        if UIS.MouseBehavior ~= Enum.MouseBehavior.Default then
-            UIS.MouseBehavior = Enum.MouseBehavior.Default
-        end
     end
 end))
 local Options = Library.Options -- was missing: D_MapName callback indexed a nil global, threw
