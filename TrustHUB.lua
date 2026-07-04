@@ -241,25 +241,39 @@ end
 -- back to the lobby. File-backed per-account (LP.Name) so multiple accounts
 -- run side by side under a multi-instance launcher without clobbering each
 -- other's count.
-local SESSION_FILE = "TrustHUB_" .. LP.Name .. "_Session.txt"
-local function loadPersistedGameCount()
-    local ok, val = pcall(function()
+-- Unified per-account session store (JSON). Holds everything that has to
+-- survive a lobby<->mission hop but reset on a genuine cold Roblox launch:
+--   gameCount   — "Return After X Games" counter
+--   sessionStart— os.time() the session began (real wall clock, unlike tick()
+--                 which is per-Lua-state and so resets to ~0 on every reload —
+--                 that reset was why the Session timer kept dropping to 0)
+--   goldEarned  — cumulative POSITIVE gold deltas only (mission rewards), so
+--                 spending gold on upgrades never drives it negative
+-- File name keyed on LP.Name so 4 accounts under one launcher don't collide.
+local HttpService = game:GetService("HttpService")
+local SESSION_FILE = "TrustHUB_" .. LP.Name .. "_Session.json"
+local function loadSession()
+    local ok, data = pcall(function()
         if isfile and isfile(SESSION_FILE) then
-            return tonumber(readfile(SESSION_FILE))
+            return HttpService:JSONDecode(readfile(SESSION_FILE))
         end
     end)
-    return (ok and val) or 0
+    if ok and type(data) == "table" then
+        data.gameCount   = tonumber(data.gameCount) or 0
+        data.sessionStart= tonumber(data.sessionStart) or os.time()
+        data.goldEarned  = tonumber(data.goldEarned) or 0
+        return data
+    end
+    return { gameCount = 0, sessionStart = os.time(), goldEarned = 0 }
 end
-local function savePersistedGameCount(n)
-    pcall(function() writefile(SESSION_FILE, tostring(n)) end)
+local function saveSession(s)
+    pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(s)) end)
 end
--- Reported bug: the persisted count above also survived a full Roblox close
--- and relaunch, which shouldn't count as a continuation of the same farm
--- session. queue_on_teleport's own code only runs after a REAL teleport
--- lands (never on a plain autoexec/manual run), so it's used here to arm a
--- one-shot marker file; on script start we check it and only keep the old
--- count if it's actually armed (i.e. we really did just hop through a
--- teleport). A cold Roblox launch never armed it, so the count resets.
+-- A genuine cold launch must start a fresh session; a teleport hop must
+-- continue the existing one. queue_on_teleport's payload only runs after a
+-- REAL teleport lands (never on a plain autoexec/manual run), so it arms a
+-- one-shot marker file; here we consume it and only keep the old session when
+-- it was actually armed. Cold launch never armed it → fresh session.
 local TELEPORT_MARKER_FILE = "TrustHUB_" .. LP.Name .. "_TeleportFlag.txt"
 local function isTeleportContinuation()
     local ok, armed = pcall(function()
@@ -271,8 +285,11 @@ local function isTeleportContinuation()
     end)
     return ok and armed
 end
+local SESSION = loadSession()
 if not isTeleportContinuation() then
-    savePersistedGameCount(0) -- genuine cold start (fresh Roblox launch): reset
+    -- fresh cold start: reset everything
+    SESSION = { gameCount = 0, sessionStart = os.time(), goldEarned = 0 }
+    saveSession(SESSION)
 end
 -- Re-arms the reload-on-teleport hook for the *next* teleport only (that's
 -- how queue_on_teleport works — it doesn't stay armed across multiple hops on
@@ -386,63 +403,12 @@ local function refreshMapData()
     if ok and data then ST.mapData = data end
     return ST.mapData
 end
--- Real per-type difficulty gates, confirmed live in
--- Modules.Storage.Values.Difficulty_Potential — same table both the game's
--- own client-side difficulty picker (User Interface.Missions:Difficulty) and
--- the server-side create gate read from.
-local DIFFICULTY_POTENTIAL = {
-    Missions = {{"Easy",0},{"Normal",2},{"Hard",5},{"Severe",9},{"Aberrant",12}},
-    Raids    = {{"Hard",6},{"Severe",10},{"Aberrant",13}},
-    Waves    = {{"Easy",0}},
-}
--- Mirrors Modules.Utilities.Shared.Get_Potential exactly: average upgrade
--- level across every stat category of the currently equipped weapon,
--- floored. `data.Upgrades[data.Weapon]` comes from the same "Data"/"Copy"
--- call already used for refreshMapData/getWeaponType.
-local function getPotential()
-    local data = ST.mapData or refreshMapData()
-    local weapon = data and data.Weapon
-    local ups = data and data.Upgrades and weapon and data.Upgrades[weapon]
-    if not ups then return 0 end
-    local sum, count = 0, 0
-    for _, v in pairs(ups) do sum = sum + v; count = count + 1 end
-    if count == 0 then count = 1 end
-    return math.floor(sum / count)
-end
--- Live-confirmed live in a mission: Blades and Spears use different stat key
--- sets entirely (Modules.Storage.Values.Alternate_Stats maps ODM_Damage <->
--- TS_Damage, ODM_Control <-> TS_Control, etc — Spears never has "ODM_*" keys
--- at all), and even for Blades the previous hardcoded list was missing
--- "Swing_Duration" (confirmed real in Modules.Utilities.Stats.Weapon_Stats).
--- `data.Upgrades[data.Weapon]` — the same table getPotential() above reads —
--- has exactly the real key set for whatever weapon is actually equipped, so
--- read it live instead of hardcoding a per-weapon category list.
-local function getUpgradeableCategories()
-    local data = ST.mapData or refreshMapData()
-    local weapon = data and data.Weapon
-    local ups = data and data.Upgrades and weapon and data.Upgrades[weapon]
-    if not ups then return {} end
-    local cats = {}
-    for k in pairs(ups) do table.insert(cats, k) end
-    return cats
-end
--- Picks the hardest difficulty the player's current gear can actually clear
--- right now (same threshold walk as the game's own picker), mapped to an
--- index in diffOrderHardToEasy so the existing fail-triggered step-down
--- fallback still works underneath it (Modifiers/party-size issues aren't
--- gear-related and can still block a start the potential check wouldn't catch).
-local function getMaxClearableDiffIdx(startType)
-    local tiers = DIFFICULTY_POTENTIAL[startType] or DIFFICULTY_POTENTIAL.Missions
-    local potential = getPotential()
-    local best = tiers[1][1]
-    for _, tier in ipairs(tiers) do
-        if tier[2] <= potential then best = tier[1] end
-    end
-    for i, name in ipairs(diffOrderHardToEasy) do
-        if name == best then return i end
-    end
-    return #diffOrderHardToEasy
-end
+-- NOTE on gear Potential / "read the hardest clearable difficulty": removed.
+-- It required the account upgrade levels, which only exist in the client's
+-- Actor Cache.Data — Data/Copy returns nil in the lobby (confirmed live), so
+-- any potential math there computes 0 and always picks Easy. AutoDifficulty /
+-- "Hardest" now just start at the hardest tier and step down when the server
+-- rejects the Create (see lobbyLoop), which needs no local gear data.
 local function getWeaponType()
     if not CFG.WeaponAutoDetect then return ST.weaponType end
     local data = ST.mapData or refreshMapData()
@@ -1089,18 +1055,20 @@ local function lobbyLoop()
             local useAutoCap = CFG.AutoDifficulty or CFG.Difficulty == "Hardest"
             if useAutoCap then
                 if ST.stayedInLobby then
-                    -- previous attempt didn't leave the lobby: step down one difficulty tier
+                    -- previous attempt didn't leave the lobby (gear too low for
+                    -- that tier): step down one difficulty and retry.
                     ST.autoDiffIdx = math.min(ST.autoDiffIdx + 1, #diffOrderHardToEasy)
                     warn("[Trust-HUB] Mission didn't start, trying lower difficulty: " .. diffOrderHardToEasy[ST.autoDiffIdx])
                 else
-                    -- Fresh attempt (not a fail-retry): recompute straight from
-                    -- real equipped-gear Potential instead of trial-and-error
-                    -- stepping down from Aberrant every single lobby visit — this
-                    -- is what an AFK-safe "give me the hardest I can actually
-                    -- clear right now" needs, and it re-reads gear each time so
-                    -- it tracks Auto Upgrade Gear's progress over a long session.
-                    pcall(refreshMapData)
-                    ST.autoDiffIdx = getMaxClearableDiffIdx(CFG.StartType)
+                    -- Fresh attempt: start at the HARDEST tier and let the
+                    -- server's own gear gate reject it (→ step down above).
+                    -- The gear Potential can't be read in the lobby at all
+                    -- (Data/Copy returns nil there, confirmed live), so a
+                    -- potential-based pick would always compute 0 → Easy;
+                    -- trying hardest-first and stepping down on rejection is
+                    -- the only thing that actually lands the true max tier,
+                    -- and it's what the friend's RamenHub "Hardest" does too.
+                    ST.autoDiffIdx = 1
                 end
             end
             ST.stayedInLobby = true -- cleared below once we leave the lobby
@@ -1163,7 +1131,8 @@ local function lobbyLoop()
                 ST.gameCount = ST.gameCount + 1
                 local wantLeave = CFG.AutoReturn and ST.gameCount >= CFG.ReturnAfter
                 if wantLeave then ST.gameCount = 0 end
-                savePersistedGameCount(ST.gameCount)
+                SESSION.gameCount = ST.gameCount
+                saveSession(SESSION)
                 -- Simulating the click (VIM mouse events, even with the
                 -- GuiInset offset fixed) only updated the button's local
                 -- visual state (turned green) without the server-side vote
@@ -1241,22 +1210,46 @@ local SKILL_TREE = {
         ["Cooldown Reduction"] = {"70","71","72","73","74","75","76","77","78","79","80","90","91","92","93","94","95","96","97","98"},
     },
 }
--- The game's own Increase() (Equipment.lua:941-946) treats a nil Invoke
--- result as "Not enough Gold!" specifically, not a generic failure — mirror
--- that instead of a flat success/fail notification.
+-- Upgrades happen in the lobby only — firing the remote mid-mission is wasted
+-- calls (and Data/Copy returns nil there anyway, confirmed live).
+local function isInLobby()
+    local mapAttr = workspace:GetAttribute("Map")
+    return mapAttr and string.find(string.lower(tostring(mapAttr)), "lobby") ~= nil
+end
+-- Real upgrade stat keys, read live from the game's own upgrade UI
+-- (Interface.Equipment.Stats.<Weapon>) and confirmed accepted by the server:
+--   * The remote wants a LIST, not a bare string — GET:InvokeServer(
+--     "S_Equipment","Upgrade",{"ODM_Damage"}) returns a table (accepted),
+--     while the bare string "ODM_Damage" returns nil (ignored). This single
+--     detail is why Auto Upgrade never did anything before.
+--   * Crit keys are the un-prefixed data names (Crit_Damage/Crit_Chance), not
+--     the UI CanvasGroup names (ODM_Crit_Damage) — the server rejects the
+--     prefixed form.
+--   * The server validates the stat against the equipped weapon: ODM_* only
+--     lands on Blades, TS_* only on Spears. Sending the wrong weapon's list
+--     just returns nil, so we can auto-detect by trying Blades then Spears.
+local BLADE_UPGRADES = {"ODM_Damage","ODM_Gas","ODM_Speed","ODM_Range","ODM_Control","Crit_Damage","Crit_Chance","Blade_Durability"}
+local SPEAR_UPGRADES = {"TS_Damage","TS_Gas","TS_Speed","TS_Range","TS_Control","Crit_Damage","Crit_Chance","Blast_Radius"}
 upgradeAllGear = function()
-    pcall(refreshMapData) -- re-read before upgrading so weapon switches are picked up
-    local cats = getUpgradeableCategories()
-    if #cats == 0 then return false end
-    local ok, result = pcall(function() return GET:InvokeServer("S_Equipment", "Upgrade", cats) end)
-    if ok and Library then
-        if result ~= nil then
-            Library:Notify("Gear upgraded!", 3)
-        else
-            Library:Notify("Upgrade skipped: not enough Gold", 3)
+    if not isInLobby() then return false end
+    -- Try the last-known weapon's list first; if the server rejects it (nil),
+    -- the other weapon is equipped — try that and remember it.
+    local order = (ST.weaponType == "Spears")
+        and { {"Spears", SPEAR_UPGRADES}, {"Blades", BLADE_UPGRADES} }
+        or  { {"Blades", BLADE_UPGRADES}, {"Spears", SPEAR_UPGRADES} }
+    local accepted = false
+    for _, pair in ipairs(order) do
+        local ok, result = pcall(function() return GET:InvokeServer("S_Equipment", "Upgrade", pair[2]) end)
+        if ok and type(result) == "table" then
+            ST.weaponType = pair[1]
+            accepted = true
+            break
         end
     end
-    return ok, result
+    if Library then
+        Library:Notify(accepted and "Gear upgraded!" or "Upgrade: not enough Gold / maxed", 3)
+    end
+    return accepted
 end
 local function trySkillUnlock(id)
     return pcall(function() return GET:InvokeServer("S_Equipment", "Unlock", { id }) end)
@@ -1274,6 +1267,10 @@ end
 local function upgradeLoop()
     while ST.running do
         task.wait(15)
+        -- All three of these (skill points, skill tree, gear) only apply in
+        -- the lobby — skip the whole batch mid-mission so we don't fire dead
+        -- S_Equipment calls every 15s during a run.
+        if not isInLobby() then continue end
         if CFG.AutoSpendSP then
             local ids = (CFG.SkillPath == "Support Skills") and SUPPORT_SKILL_IDS or BLADE_SKILL_IDS
             for _, id in ipairs(ids) do trySkillUnlock(id); task.wait(0.2) end
@@ -1372,7 +1369,19 @@ local function formatDuration(seconds)
     local s = math.floor(seconds % 60)
     return string.format("%02d:%02d:%02d", h, m, s)
 end
+-- Compact number: 1234 -> "1.2K", 3450000 -> "3.4M". Keeps the panel readable
+-- once gold/hour reaches the hundred-thousands on a long farm.
+local function formatNumber(n)
+    n = tonumber(n) or 0
+    local neg = n < 0 and "-" or ""
+    n = math.abs(n)
+    if n >= 1e9 then return string.format("%s%.2fB", neg, n / 1e9) end
+    if n >= 1e6 then return string.format("%s%.2fM", neg, n / 1e6) end
+    if n >= 1e3 then return string.format("%s%.1fK", neg, n / 1e3) end
+    return neg .. tostring(math.floor(n))
+end
 local lastStatsUpdate = 0
+local lastSessionSave = 0
 track(RunService.Heartbeat:Connect(function()
     if not statsPanel then return end
     statsPanel.Gui.Enabled = CFG.ShowStatsPanel
@@ -1381,25 +1390,36 @@ track(RunService.Heartbeat:Connect(function()
     if now - lastStatsUpdate < 1 then return end
     lastStatsUpdate = now
 
-    statsPanel.Rows["Session"].Text = "Session: " .. formatDuration(now - ST.startT)
+    -- Real wall-clock elapsed (survives hops) — not tick(), which is per-Lua
+    -- state and resets to ~0 every reload.
+    local elapsed = os.time() - SESSION.sessionStart
+    statsPanel.Rows["Session"].Text = "Session: " .. formatDuration(elapsed)
 
     local slayText = readMissionKillsText()
     statsPanel.Rows["Kills (mission)"].Text = "Kills (mission): " .. (slayText and slayText:match("%[(.-)%]") or "--")
 
     statsPanel.Rows["Missions"].Text = "Missions: " .. tostring(ST.gameCount)
 
+    -- Gold earned = sum of POSITIVE balance changes only. Spending on gear
+    -- upgrades drops the balance, which we ignore, so the figure never goes
+    -- negative and reflects only what missions actually paid out.
     local gold = readGold()
     if gold then
-        if ST.startGold == 0 then ST.startGold = gold end
-        local earned = gold - ST.startGold
-        statsPanel.Rows["Gold earned"].Text = "Gold earned: " .. tostring(earned)
-        -- Simple session-average extrapolation ("earn rate so far, per hour")
-        -- rather than tracking individual mission durations separately —
-        -- same inputs (startGold/startT) already exist and this is the same
-        -- number a per-mission average converges to anyway.
-        local elapsed = now - ST.startT
-        local perHour = elapsed > 5 and math.floor(earned / elapsed * 3600) or 0
-        statsPanel.Rows["Gold/Hour"].Text = "Gold/Hour: " .. tostring(perHour)
+        if ST.lastGold and gold > ST.lastGold then
+            SESSION.goldEarned = SESSION.goldEarned + (gold - ST.lastGold)
+        end
+        ST.lastGold = gold
+        statsPanel.Rows["Gold earned"].Text = "Gold earned: " .. formatNumber(SESSION.goldEarned)
+        local perHour = elapsed > 5 and math.floor(SESSION.goldEarned / elapsed * 3600) or 0
+        statsPanel.Rows["Gold/Hour"].Text = "Gold/Hour: " .. formatNumber(perHour)
+    end
+
+    -- Persist the accumulating session every ~10s so a crash/close loses at
+    -- most 10s of gold/time, without hammering the disk every second.
+    if now - lastSessionSave >= 10 then
+        lastSessionSave = now
+        SESSION.gameCount = ST.gameCount
+        saveSession(SESSION)
     end
 end))
 -- ══════════════════════════════════════════════════════════
@@ -1481,10 +1501,14 @@ local function masterStart()
     ST.running = true
     ST.startT = tick()
     ST.lastKill = tick()
-    ST.startGold = readGold() or 0
     ST.titanKillCount = 0
     ST.masteryCombo = 1
-    ST.gameCount = loadPersistedGameCount()
+    -- Session values come from the persisted store (survives hops), not from
+    -- fresh tick()/readGold each load. lastGold seeds the positive-delta gold
+    -- tracker with the current balance so the first reading never counts the
+    -- whole balance as "earned".
+    ST.gameCount = SESSION.gameCount
+    ST.lastGold = readGold()
     _notifiedNapes = {}
     buildStatsPanel()
     if CFG.DeleteMap then deleteMap() end
