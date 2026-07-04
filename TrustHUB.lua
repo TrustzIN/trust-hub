@@ -280,15 +280,25 @@ end
 -- reload, it keeps re-arming itself each hop as long as PersistReload is on;
 -- turning the toggle off just stops calling this, so the next teleport won't
 -- bring the hub back.
+-- Public repo so game:HttpGet needs no auth header (same reason LinoriaLib's
+-- own raw.githubusercontent.com fetches work) — pushed via
+-- https://github.com/TrustzIN/trust-hub. Fetching this on every hop means
+-- every account running this script picks up an edit here immediately, no
+-- manual copy to the 3 local files needed for that account. Falls back to
+-- the local Trust_HUB.lua copy if the fetch fails (offline, repo down, etc).
+local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/TrustzIN/trust-hub/master/TrustHUB.lua"
 local function registerTeleportReload()
     if not CFG.PersistReload then return end
     pcall(function()
         queue_on_teleport(([[
             pcall(function() writefile(%q, "1") end)
-            if readfile and isfile and isfile("Trust_HUB.lua") then
+            local ok, src = pcall(function() return game:HttpGet(%q) end)
+            if ok and src and #src > 0 then
+                loadstring(src)()
+            elseif readfile and isfile and isfile("Trust_HUB.lua") then
                 loadstring(readfile("Trust_HUB.lua"))()
             end
-        ]]):format(TELEPORT_MARKER_FILE))
+        ]]):format(TELEPORT_MARKER_FILE, REMOTE_SCRIPT_URL))
     end)
 end
 registerTeleportReload()
