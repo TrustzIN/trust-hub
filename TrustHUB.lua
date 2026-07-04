@@ -715,28 +715,37 @@ end
 -- ══════════════════════════════════════════════════════════
 -- [9] AUTO-REFILL (VIM R-Key + Remote Fallback)
 -- ══════════════════════════════════════════════════════════
--- Segment durability (0-7 per hand, breaks per hit — see Modules.Utilities.Blades
--- Check_Durability/Break_Segment) lives on physical parts under the character's
--- rig, not on the HUD. The old code read HUD.Sets, but that field is
--- Supply.Reloads (spare blade sets remaining, e.g. "3 / 3") — it only
--- decrements when you actually swap, so it stays "3/3" even with a fully
--- broken blade and never signalled a reload. Also hud:FindFirstChild("Sets")
--- was non-recursive while Sets sits 4 levels deep (Main.Top.7.Blades.Sets),
--- so it always returned nil and checkReload was a permanent no-op regardless.
+-- Blade durability (0-7 segments remaining). The previous version counted the
+-- rig's Blade_1..7 part transparencies — WRONG: those parts are the drawn
+-- blade meshes, which sit at Transparency=1 whenever the blade is sheathed
+-- (idle hovering), so it read 0 intact even at FULL durability, making
+-- checkReload think the blade was always broken → it reloaded nonstop and
+-- drained the reserve sets (the "stuck at 1/3, keeps grabbing" bug).
+--
+-- The real durability is the HUD bar fill. Confirmed live from the game's own
+-- HUD.Update (Modules.User Interface.HUD): for "Blades" it sets
+-- Main.Top.7.Blades.Inner.Bar.Gradient.Offset.X to Blades_X[segments], the
+-- exact lookup table below. Reverse it: read the gradient offset, snap to the
+-- nearest table entry → true segment count.
+local BLADES_X = {[0]=-0.15,[1]=0.02,[2]=0.17,[3]=0.34,[4]=0.5,[5]=0.675,[6]=0.765,[7]=1}
 local function countIntactSegments()
-    local charsFolder = workspace:FindFirstChild("Characters")
-    local charFolder = charsFolder and charsFolder:FindFirstChild(LP.Name)
-    local rig = charFolder and charFolder:FindFirstChild("Rig_" .. LP.Name)
-    local hand = rig and rig:FindFirstChild("RightHand")
-    if not hand then return nil end
-    local intact = 0
-    for i = 1, 7 do
-        local seg = hand:FindFirstChild("Blade_" .. i)
-        if seg and seg.Transparency < 1 then
-            intact = intact + 1
-        end
+    local pg = LP:FindFirstChild("PlayerGui")
+    local iface = pg and pg:FindFirstChild("Interface")
+    local hud = iface and iface:FindFirstChild("HUD")
+    local main = hud and hud:FindFirstChild("Main")
+    local top = main and main:FindFirstChild("Top")
+    local seven = top and top:FindFirstChild("7")
+    local blades = seven and seven:FindFirstChild("Blades")
+    local bar = blades and blades:FindFirstChild("Inner") and blades.Inner:FindFirstChild("Bar")
+    local grad = bar and bar:FindFirstChild("Gradient")
+    if not grad then return nil end -- HUD not present (lobby / respawning)
+    local x = grad.Offset.X
+    local best, bestDist = 7, math.huge
+    for seg, val in pairs(BLADES_X) do
+        local d = math.abs(x - val)
+        if d < bestDist then bestDist = d; best = seg end
     end
-    return intact
+    return best
 end
 -- Sets/Reloads (Main.Top.7.Blades.Sets, "X / Y") — the spare kit count, not
 -- the current blade's segment wear. Same exact-path caution as readGold():
