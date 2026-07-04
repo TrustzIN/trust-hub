@@ -262,9 +262,10 @@ local function loadSession()
         data.gameCount   = tonumber(data.gameCount) or 0
         data.sessionStart= tonumber(data.sessionStart) or os.time()
         data.goldEarned  = tonumber(data.goldEarned) or 0
+        data.lastGold    = tonumber(data.lastGold) -- may be nil (unknown yet)
         return data
     end
-    return { gameCount = 0, sessionStart = os.time(), goldEarned = 0 }
+    return { gameCount = 0, sessionStart = os.time(), goldEarned = 0, lastGold = nil }
 end
 local function saveSession(s)
     pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(s)) end)
@@ -288,7 +289,7 @@ end
 local SESSION = loadSession()
 if not isTeleportContinuation() then
     -- fresh cold start: reset everything
-    SESSION = { gameCount = 0, sessionStart = os.time(), goldEarned = 0 }
+    SESSION = { gameCount = 0, sessionStart = os.time(), goldEarned = 0, lastGold = nil }
     saveSession(SESSION)
 end
 -- Re-arms the reload-on-teleport hook for the *next* teleport only (that's
@@ -772,49 +773,49 @@ local function findNearestRefillStation()
     end
     return nearest
 end
--- Runs off the main farmLoop thread — the out-of-kits branch below moves the
--- player and task.wait(1)s for the Touched event, which used to stall combat
--- for a full second every time it fired.
+-- Reload bug fix (reported: reload animation firing ~3x, "going back and
+-- forth", throwing away 2-3 segments so you end up at 1/3 or 0/3):
+--   1. The old code fired the reload TWICE per trigger — a VIM R keypress
+--      (which makes the game's own handler call GET Blades/Reload internally)
+--      AND a direct GET Blades/Reload. Two reloads = double swap animation +
+--      wasted segments. Now it's the single direct call only, no VIM press.
+--   2. The guard was a bare boolean cleared at the end of a fast task.spawn,
+--      but the swap animation/segment refresh takes longer than that, so the
+--      next 0.1s farm tick still saw 0 blades and fired AGAIN (and again).
+--      Now a time-based cooldown blocks re-fire until the reload has actually
+--      had time to land.
+local reloadCooldownUntil = 0
 local reloadInProgress = false
 local function checkReload()
     if not CFG.AutoReload or reloadInProgress then return end
+    if tick() < reloadCooldownUntil then return end
     local bladeCount = countIntactSegments()
     if not bladeCount then return end -- rig not found this tick (respawning, etc.)
     if bladeCount > 0 then return end
     reloadInProgress = true
+    reloadCooldownUntil = tick() + 1.5 -- block re-trigger while the swap plays
     task.spawn(function()
         local sets = readSets()
         if sets and sets <= 0 then
-            -- Out of spare kits entirely — a mid-air reload has nothing to pull
-            -- from. The real "Full_Reload" path (Modules.Core.ODMG:220-238) only
-            -- fires when Modules.Zones.Refill_Station is set, which only happens
-            -- when the character's Hitbox physically touches a "Refill" part
-            -- (Modules.Utilities.Zones:198-221) — so fly to the nearest one and
-            -- fire the same call that touch handler makes:
-            -- POST:FireServer("Attacks", "Reload", refillPart).
+            -- Out of spare kits: a mid-air reload has nothing to pull from.
+            -- Fly to the nearest "Refill" station and fire the same call its
+            -- Touched handler makes (Modules.Utilities.Zones / Core.ODMG:238).
             local station = findNearestRefillStation()
             if station then
                 local _, hrp = getChar()
                 if hrp then
                     pcall(function() hrp.CFrame = CFrame.new(station.Position) end)
-                    task.wait(1) -- let the Touched event register Zones.Refill_Station
+                    task.wait(1) -- let the Touched event register the station
                     pcall(function() POST:FireServer("Attacks", "Reload", station) end)
+                    reloadCooldownUntil = tick() + 1.5
                 end
             end
             reloadInProgress = false
             return
         end
-        -- Live-confirmed in Modules.Core.ODMG:274: the game's own reload key
-        -- handler calls exactly GET:InvokeServer("Blades", "Reload") and plays
-        -- the swap animation if it returns true. There is no separate
-        -- "Full_Reload"/"Right"/"Left" GET pair — that was fabricated (same
-        -- pattern as the old "Hardest" difficulty and "S_Blades" guesses); the
-        -- game's only other reload path is the Attacks/Reload+station one above.
-        pcall(function()
-            VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-            task.wait(0.1)
-            VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-        end)
+        -- Have reserves: single swap. Confirmed the game's own reload handler
+        -- (Modules.Core.ODMG:274) calls exactly this and nothing else — no VIM
+        -- keypress, which is what was causing the double fire.
         pcall(function() GET:InvokeServer("Blades", "Reload") end)
         reloadInProgress = false
     end)
@@ -1235,27 +1236,47 @@ end
 --     just returns nil, so we can auto-detect by trying Blades then Spears.
 local BLADE_UPGRADES = {"ODM_Damage","ODM_Gas","ODM_Speed","ODM_Range","ODM_Control","Crit_Damage","Crit_Chance","Blade_Durability"}
 local SPEAR_UPGRADES = {"TS_Damage","TS_Gas","TS_Speed","TS_Range","TS_Control","Crit_Damage","Crit_Chance","Blast_Radius"}
+-- One Upgrade call = one level bought on the cheapest affordable stat in the
+-- list (returns a table when it upgraded something, nil when it couldn't —
+-- out of gold, or everything maxed). To actually spend the whole balance we
+-- have to call it repeatedly until it returns nil, not just once.
+local _upgradeRunning = false
 upgradeAllGear = function()
-    if not isInLobby() then return false end
-    ST.status = "Upgrading gear"
-    -- Try the last-known weapon's list first; if the server rejects it (nil),
-    -- the other weapon is equipped — try that and remember it.
-    local order = (ST.weaponType == "Spears")
-        and { {"Spears", SPEAR_UPGRADES}, {"Blades", BLADE_UPGRADES} }
-        or  { {"Blades", BLADE_UPGRADES}, {"Spears", SPEAR_UPGRADES} }
-    local accepted = false
-    for _, pair in ipairs(order) do
-        local ok, result = pcall(function() return GET:InvokeServer("S_Equipment", "Upgrade", pair[2]) end)
-        if ok and type(result) == "table" then
-            ST.weaponType = pair[1]
-            accepted = true
-            break
+    if not isInLobby() or _upgradeRunning then return false end
+    _upgradeRunning = true
+    task.spawn(function()
+        ST.status = "Upgrading gear"
+        -- Detect the equipped weapon once (last-known first, else the other):
+        -- send its list; a table back means it's the right weapon.
+        local order = (ST.weaponType == "Spears")
+            and { {"Spears", SPEAR_UPGRADES}, {"Blades", BLADE_UPGRADES} }
+            or  { {"Blades", BLADE_UPGRADES}, {"Spears", SPEAR_UPGRADES} }
+        local list, bought = nil, 0
+        for _, pair in ipairs(order) do
+            local ok, result = pcall(function() return GET:InvokeServer("S_Equipment", "Upgrade", pair[2]) end)
+            if ok and type(result) == "table" then
+                ST.weaponType = pair[1]
+                list = pair[2]
+                bought = 1
+                break
+            end
         end
-    end
-    if Library then
-        Library:Notify(accepted and "Gear upgraded!" or "Upgrade: not enough Gold / maxed", 3)
-    end
-    return accepted
+        -- Keep buying on the detected weapon's list until the server says no
+        -- (nil). Cap iterations so a weird server response can't spin forever.
+        if list then
+            for _ = 1, 300 do
+                local ok, result = pcall(function() return GET:InvokeServer("S_Equipment", "Upgrade", list) end)
+                if not (ok and type(result) == "table") then break end
+                bought = bought + 1
+                task.wait(0.06) -- fast, but not a tight spin (executor pressure)
+            end
+        end
+        if Library then
+            Library:Notify(bought > 0 and ("Bought " .. bought .. " gear upgrade(s)") or "Upgrade: not enough Gold / maxed", 3)
+        end
+        _upgradeRunning = false
+    end)
+    return true
 end
 local function trySkillUnlock(id)
     return pcall(function() return GET:InvokeServer("S_Equipment", "Unlock", { id }) end)
@@ -1466,10 +1487,10 @@ track(RunService.Heartbeat:Connect(function()
     -- negative and reflects only what missions actually paid out.
     local gold = readGold()
     if gold then
-        if ST.lastGold and gold > ST.lastGold then
-            SESSION.goldEarned = SESSION.goldEarned + (gold - ST.lastGold)
+        if SESSION.lastGold and gold > SESSION.lastGold then
+            SESSION.goldEarned = SESSION.goldEarned + (gold - SESSION.lastGold)
         end
-        ST.lastGold = gold
+        SESSION.lastGold = gold
         statsPanel.Rows["Gold earned"].Text = "Gold earned: " .. formatNumber(SESSION.goldEarned)
         local perHour = elapsed > 5 and math.floor(SESSION.goldEarned / elapsed * 3600) or 0
         statsPanel.Rows["Gold/Hour"].Text = "Gold/Hour: " .. formatNumber(perHour)
@@ -1564,12 +1585,14 @@ local function masterStart()
     ST.lastKill = tick()
     ST.titanKillCount = 0
     ST.masteryCombo = 1
-    -- Session values come from the persisted store (survives hops), not from
-    -- fresh tick()/readGold each load. lastGold seeds the positive-delta gold
-    -- tracker with the current balance so the first reading never counts the
-    -- whole balance as "earned".
+    -- Session values come from the persisted store (survives hops). lastGold
+    -- must ALSO persist: re-seeding it to the current balance on every reload
+    -- meant the mission-reward jump (which lands across the mission->lobby
+    -- reload boundary) was never seen as a positive delta, so Gold earned
+    -- stayed 0. Keep the persisted lastGold across a hop; only seed from the
+    -- current balance on a genuine cold start (SESSION.lastGold == nil).
     ST.gameCount = SESSION.gameCount
-    ST.lastGold = readGold()
+    if SESSION.lastGold == nil then SESSION.lastGold = readGold() end
     _notifiedNapes = {}
     buildStatsPanel()
     if CFG.DeleteMap then deleteMap() end
@@ -1624,18 +1647,17 @@ local Window = Library:CreateWindow({
 -- UnlockMouseWhileOpen handling and usually winning it during combat. Snap it
 -- back the instant it changes while our menu is open, instead of fighting it
 -- once per Toggle call.
--- Both cursor fixes are now purely reactive (property-changed), not a
--- per-frame Heartbeat: snap MouseBehavior back to Default and re-show the
--- icon only when the game actually changes them while our menu is open. The
--- old Heartbeat variant re-checked every single frame for the same effect.
-track(UIS:GetPropertyChangedSignal("MouseBehavior"):Connect(function()
-    if Library.Toggled and UIS.MouseBehavior ~= Enum.MouseBehavior.Default then
-        UIS.MouseBehavior = Enum.MouseBehavior.Default
-    end
-end))
-track(UIS:GetPropertyChangedSignal("MouseIconEnabled"):Connect(function()
-    if Library.Toggled and not UIS.MouseIconEnabled then
-        UIS.MouseIconEnabled = true
+-- Cursor fix stays a Heartbeat: the reactive property-changed version missed
+-- the case where the menu opens while the icon is ALREADY hidden (no property
+-- change fires, so it never re-shows) and lost the cursor mid-mission. A
+-- per-frame check of two booleans is negligible next to the farm loop; the
+-- executor auto-close is the bytecode watcher, not this.
+track(RunService.Heartbeat:Connect(function()
+    if Library and Library.Toggled then
+        if not UIS.MouseIconEnabled then UIS.MouseIconEnabled = true end
+        if UIS.MouseBehavior ~= Enum.MouseBehavior.Default then
+            UIS.MouseBehavior = Enum.MouseBehavior.Default
+        end
     end
 end))
 local Options = Library.Options -- was missing: D_MapName callback indexed a nil global, threw
