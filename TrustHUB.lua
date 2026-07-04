@@ -171,7 +171,7 @@ local CFG = {
     MoveMode="Gliding", Noclip=true, FloatHeight=170, HoverSpeed=400,
     TitanESP=false, BossESP=false, RemoveFog=false, DeleteMap=true,
     AutoSpendSP=false, SkillPath="Blade Skills", AutoUpGear=false,
-    ShowStatsPanel=true, PersistReload=true,
+    ShowStatsPanel=true, PersistReload=true, Disable3D=false,
     -- v3.0: combat upgrades
     RoarDodge=true, InjuryRemove=true, StallMode=true,
     ObjectiveTracking=true, KillNotif=false,
@@ -1661,6 +1661,10 @@ gVis:AddToggle("T_RemoveFog", { Text = "Remove Fog",            Default = false,
 gVis:AddToggle("T_DeleteMap", { Text = "Delete Map (FPS Boost)",Default = true,  Callback = function(v) CFG.DeleteMap = v; if v then deleteMap() end end })
 gVis:AddToggle("T_InjuryRem", { Text = "Auto Remove Injuries",  Default = true,  Callback = function(v) CFG.InjuryRemove = v end })
 gVis:AddToggle("T_KillNotif", { Text = "Kill Notifications",    Default = false, Callback = function(v) CFG.KillNotif = v end })
+gVis:AddToggle("T_Disable3D", { Text = "Disable 3D Rendering (FPS Boost)", Default = false, Callback = function(v)
+    CFG.Disable3D = v
+    RunService:Set3dRenderingEnabled(not v)
+end })
 -- ═══ TAB: UTILITIES ═══
 local TabUtils = Window:AddTab("Utilities")
 local gTool = TabUtils:AddLeftGroupbox("Tools")
