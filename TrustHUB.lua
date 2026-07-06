@@ -713,44 +713,24 @@ local function moveToNape(hrp, nape)
     return dir.Magnitude
 end
 -- ══════════════════════════════════════════════════════════
--- [9] AUTO-REFILL (VIM R-Key + Remote Fallback)
+-- [9] AUTO-REFILL (user's proven working method)
 -- ══════════════════════════════════════════════════════════
--- Blade durability (0-7 segments remaining). The previous version counted the
--- rig's Blade_1..7 part transparencies — WRONG: those parts are the drawn
--- blade meshes, which sit at Transparency=1 whenever the blade is sheathed
--- (idle hovering), so it read 0 intact even at FULL durability, making
--- checkReload think the blade was always broken → it reloaded nonstop and
--- drained the reserve sets (the "stuck at 1/3, keeps grabbing" bug).
---
--- The real durability is the HUD bar fill. Confirmed live from the game's own
--- HUD.Update (Modules.User Interface.HUD): for "Blades" it sets
--- Main.Top.7.Blades.Inner.Bar.Gradient.Offset.X to Blades_X[segments], the
--- exact lookup table below. Reverse it: read the gradient offset, snap to the
--- nearest table entry → true segment count.
-local BLADES_X = {[0]=-0.15,[1]=0.02,[2]=0.17,[3]=0.34,[4]=0.5,[5]=0.675,[6]=0.765,[7]=1}
-local function countIntactSegments()
-    local pg = LP:FindFirstChild("PlayerGui")
-    local iface = pg and pg:FindFirstChild("Interface")
-    local hud = iface and iface:FindFirstChild("HUD")
-    local main = hud and hud:FindFirstChild("Main")
-    local top = main and main:FindFirstChild("Top")
-    local seven = top and top:FindFirstChild("7")
-    local blades = seven and seven:FindFirstChild("Blades")
-    local bar = blades and blades:FindFirstChild("Inner") and blades.Inner:FindFirstChild("Bar")
-    local grad = bar and bar:FindFirstChild("Gradient")
-    if not grad then return nil end -- HUD not present (lobby / respawning)
-    local x = grad.Offset.X
-    local best, bestDist = 7, math.huge
-    for seg, val in pairs(BLADES_X) do
-        local d = math.abs(x - val)
-        if d < bestDist then bestDist = d; best = seg end
-    end
-    return best
+-- The entire durability-detection saga (rig transparency, HUD bar gradient,
+-- attack-gating, VIM R) was a dead end — the display signals don't reflect
+-- true server durability while idle, and the direct reload gets rejected
+-- without the client state. The user's own working version sidesteps all of
+-- it: just fire GET Blades/Reload every 0.5s while in a match. The server
+-- only acts when the blade is actually depleted and no-ops (returns nil, no
+-- reserve consumed) when it's full, so blind spamming is safe and needs no
+-- durability read at all. When the spare SETS run out, fire the station
+-- refill POST at the "Refill" part FARTHEST from titans (safest), no teleport
+-- — the remote is proximity-validated but firing from afar is harmless.
+local function inMatch()
+    local mapAttr = workspace:GetAttribute("Map")
+    if not mapAttr then return false end
+    return string.find(string.lower(tostring(mapAttr)), "lobby") == nil
 end
--- Sets/Reloads (Main.Top.7.Blades.Sets, "X / Y") — the spare kit count, not
--- the current blade's segment wear. Same exact-path caution as readGold():
--- "Sets" only exists nested 4 levels deep under HUD, not a direct child.
-local function readSets()
+local function bladeSetsLeft()
     local pg = LP:FindFirstChild("PlayerGui")
     local iface = pg and pg:FindFirstChild("Interface")
     local hud = iface and iface:FindFirstChild("HUD")
@@ -760,87 +740,50 @@ local function readSets()
     local blades = seven and seven:FindFirstChild("Blades")
     local sets = blades and blades:FindFirstChild("Sets")
     if not sets then return nil end
-    local current = tonumber((tostring(sets.Text or ""):match("^%s*(%d+)")))
-    return current
+    return tonumber((tostring(sets.Text or ""):match("(%d+)")))
 end
--- Real refill stations found live: Workspace.Climbable.Walls.Gate.GasTanks.Refill
--- (BaseParts named "Refill", detected by the game via .Touched — see
--- Modules.Utilities.Zones:198-221). Their location isn't fixed across maps,
--- so search workspace instead of hardcoding a path (the old
--- Unclimbable/Reloads guess didn't exist at all in this map instance).
-local function findNearestRefillStation()
-    local _, hrp = getChar()
-    if not hrp then return nil end
-    local nearest, nearestDist
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d.Name == "Refill" and d:IsA("BasePart") then
-            local dist = (hrp.Position - d.Position).Magnitude
-            if not nearestDist or dist < nearestDist then
-                nearest, nearestDist = d, dist
-            end
+-- "Refill" BasePart farthest from any titan — so the station refill fires at
+-- a spot away from danger rather than the nearest one (which may be swarmed).
+local function getSafestRefill()
+    local titans = {}
+    local tf = workspace:FindFirstChild("Titans")
+    if tf then
+        for _, t in ipairs(tf:GetChildren()) do
+            local p = t:FindFirstChild("HumanoidRootPart") or t:FindFirstChild("Torso") or t.PrimaryPart
+            if p then titans[#titans + 1] = p.Position end
         end
     end
-    return nearest
+    local best, bestScore
+    for _, o in ipairs(workspace:GetDescendants()) do
+        if o.Name == "Refill" and o:IsA("BasePart") then
+            local nearT = 1e9
+            for _, tp in ipairs(titans) do
+                local d = (o.Position - tp).Magnitude
+                if d < nearT then nearT = d end
+            end
+            if not bestScore or nearT > bestScore then bestScore = nearT; best = o end
+        end
+    end
+    return best
 end
--- Reload bug fix (reported: reload animation firing ~3x, "going back and
--- forth", throwing away 2-3 segments so you end up at 1/3 or 0/3):
---   1. The old code fired the reload TWICE per trigger — a VIM R keypress
---      (which makes the game's own handler call GET Blades/Reload internally)
---      AND a direct GET Blades/Reload. Two reloads = double swap animation +
---      wasted segments. Now it's the single direct call only, no VIM press.
---   2. The guard was a bare boolean cleared at the end of a fast task.spawn,
---      but the swap animation/segment refresh takes longer than that, so the
---      next 0.1s farm tick still saw 0 blades and fired AGAIN (and again).
---      Now a time-based cooldown blocks re-fire until the reload has actually
---      had time to land.
-local reloadCooldownUntil = 0
-local reloadInProgress = false
-local function checkReload()
-    if not CFG.AutoReload or reloadInProgress then return end
-    if tick() < reloadCooldownUntil then return end
-    local bladeCount = countIntactSegments()
-    if not bladeCount then return end -- rig not found this tick (respawning, etc.)
-    if bladeCount > 0 then return end
-    reloadInProgress = true
-    reloadCooldownUntil = tick() + 1.5 -- block re-trigger while the swap plays
-    task.spawn(function()
-        local sets = readSets()
-        if sets and sets <= 0 then
-            -- Out of spare kits: a mid-air reload has nothing to pull from.
-            -- Fly to the nearest "Refill" station and fire the same call its
-            -- Touched handler makes (Modules.Utilities.Zones / Core.ODMG:238).
-            local station = findNearestRefillStation()
-            if station then
-                local _, hrp = getChar()
-                if hrp then
-                    pcall(function() hrp.CFrame = CFrame.new(station.Position) end)
-                    task.wait(1) -- let the Touched event register the station
-                    pcall(function() POST:FireServer("Attacks", "Reload", station) end)
-                    reloadCooldownUntil = tick() + 1.5
+local function reloadLoop()
+    local lastEmpty = false
+    while ST.running do
+        task.wait(0.5)
+        if CFG.AutoReload and inMatch() then
+            pcall(function() GET:InvokeServer("Blades", "Reload") end) -- top up durability (no-op when full)
+            local sets = bladeSetsLeft()
+            local empty = (sets ~= nil and sets <= 0)
+            if empty and not lastEmpty then -- edge: out of spare sets → station refill
+                local refill = getSafestRefill()
+                if refill then
+                    pcall(function() POST:FireServer("Attacks", "Reload", refill) end)
+                    pcall(function() POST:FireServer("Attacks", "Reload", refill) end)
                 end
             end
-            reloadInProgress = false
-            return
+            lastEmpty = empty
         end
-        -- Have reserves: swap to a fresh set. The reliable trigger is the R
-        -- keypress — it drives the game's OWN complete reload flow (input
-        -- handler -> ODMG -> its internal GET Blades/Reload + the client swap).
-        -- Firing our own GET on TOP of that was the double-swap that wasted a
-        -- reserve. But the keypress alone is occasionally dropped, so only if
-        -- the blade is STILL broken a moment later do we fire the direct GET
-        -- as a fallback — reliable, and it never double-swaps in the normal
-        -- case where the keypress worked.
-        pcall(function()
-            VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-            task.wait(0.05)
-            VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-        end)
-        task.wait(0.25)
-        if (countIntactSegments() or 0) == 0 then
-            pcall(function() GET:InvokeServer("Blades", "Reload") end)
-        end
-        reloadInProgress = false
-    end)
+    end
 end
 -- ══════════════════════════════════════════════════════════
 -- [10] NAPE EXTENDER
@@ -962,23 +905,8 @@ local function farmLoop()
                 continue
             end
         end
-        checkReload()
-        -- Blade fully broken → do NOT keep slashing. The game's reload flow
-        -- (Modules.Core.ODMG t2.Reload) refuses to run while the client is
-        -- mid-slash/attacking, and the farm loop otherwise fires comboSlash
-        -- every tick (no damage at 0 durability, but it keeps the client in
-        -- the slash state), so the reload could never land — the blade just
-        -- sat empty. Hover in place and skip this tick's attack until the
-        -- segments come back.
-        if CFG.AutoReload then
-            local segs = countIntactSegments()
-            if segs ~= nil and segs <= 0 then
-                hrp.AssemblyLinearVelocity = Vector3.new(0, 5, 0)
-                ST.status = "Reloading blades"
-                task.wait(0.1)
-                continue
-            end
-        end
+        -- Reload is handled entirely by reloadLoop (own 0.5s thread) — the
+        -- farm loop just keeps attacking, no reload logic or attack-gating.
         titansFolder = workspace:FindFirstChild("Titans") or titansFolder
         local reqCount = CFG.MultiTarget and CFG.MultiTargetN or 1
         local napes = getValidNapes(reqCount)
@@ -1651,6 +1579,7 @@ local function masterStart()
     trackThread(lobbyLoop)
     trackThread(upgradeLoop)
     trackThread(auxLoop) -- ESP + cutscene skip merged
+    trackThread(reloadLoop) -- blade durability + set refill
     -- Ban-attribute clearing already happens reactively via the
     -- AttributeChanged connection set up in [2]; a second 0.5s polling loop
     -- doing the exact same clear on the exact same attribute list was pure
