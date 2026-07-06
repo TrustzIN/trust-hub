@@ -730,6 +730,33 @@ local function inMatch()
     if not mapAttr then return false end
     return string.find(string.lower(tostring(mapAttr)), "lobby") == nil
 end
+-- Blade durability (0-7 segments) read from the HUD bar fill, the same signal
+-- the game's own HUD.Update writes: Main.Top.7.Blades.Inner.Bar.Gradient.Offset.X
+-- = Blades_X[segments]. Reverse-map the offset to the nearest table entry.
+-- Used ONLY to skip pointless swings while the blade is empty (reloadLoop is
+-- what actually refills it); returns nil when the HUD/bar isn't present
+-- (lobby, or a non-blade weapon whose bar path differs), which disables the
+-- gate rather than blocking attacks.
+local BLADES_X = {[0]=-0.15,[1]=0.02,[2]=0.17,[3]=0.34,[4]=0.5,[5]=0.675,[6]=0.765,[7]=1}
+local function bladeDurability()
+    local pg = LP:FindFirstChild("PlayerGui")
+    local iface = pg and pg:FindFirstChild("Interface")
+    local hud = iface and iface:FindFirstChild("HUD")
+    local main = hud and hud:FindFirstChild("Main")
+    local top = main and main:FindFirstChild("Top")
+    local seven = top and top:FindFirstChild("7")
+    local blades = seven and seven:FindFirstChild("Blades")
+    local bar = blades and blades:FindFirstChild("Inner") and blades.Inner:FindFirstChild("Bar")
+    local grad = bar and bar:FindFirstChild("Gradient")
+    if not grad then return nil end
+    local x = grad.Offset.X
+    local best, bestDist = 7, math.huge
+    for seg, val in pairs(BLADES_X) do
+        local d = math.abs(x - val)
+        if d < bestDist then bestDist = d; best = seg end
+    end
+    return best
+end
 local function bladeSetsLeft()
     local pg = LP:FindFirstChild("PlayerGui")
     local iface = pg and pg:FindFirstChild("Interface")
@@ -974,7 +1001,23 @@ local function farmLoop()
             else
                 if not atkTitanReady then task.wait() continue end
                 local dist = moveToNape(hrp, napes[1])
-                if dist <= CFG.AttackRange and ST.canHit then
+                -- Don't swing at a titan with an empty blade — it does nothing.
+                -- Keep moving to the target, but hold the attack until the
+                -- reloadLoop tops durability back up (bladeDurability is nil for
+                -- spears, so this gate never blocks them).
+                local dur = bladeDurability()
+                local outOfBlades = (dur ~= nil and dur <= 0)
+                if outOfBlades then
+                    ST.status = "Reloading blades"
+                    ST.bladeEmptySince = ST.bladeEmptySince or tick()
+                    -- Fail-open: if the reloadLoop somehow hasn't refilled
+                    -- durability after 4s, swing anyway rather than freeze
+                    -- forever waiting on a reload that isn't landing.
+                    if tick() - ST.bladeEmptySince > 4 then outOfBlades = false end
+                else
+                    ST.bladeEmptySince = nil
+                end
+                if dist <= CFG.AttackRange and ST.canHit and not outOfBlades then
                     ST.canHit = false
                     comboSlash(napes)
                     ST.lastKill = tick()
