@@ -2029,7 +2029,7 @@ gLobby:AddToggle("T_AutoPrestige", { Text = "Auto Prestige", Default = false, Ca
 gLobby:AddSlider("S_PrestigeGold", { Text = "Prestige at Gold (millions)", Default = 0, Min = 0, Max = 100, Rounding = 0, Callback = function(v) CFG.PrestigeGoldM = v end })
 gLobby:AddDropdown("D_PrestigeBoost", { Text = "Prestige Boost", Values = {"Luck Boost","EXP Boost","Gold Boost"}, Default = 1, Callback = function(v) CFG.PrestigeBoost = v end })
 gLobby:AddDivider()
-gLobby:AddToggle("T_AutoEnhance", { Text = "Auto Enhance Perk (needs Volt/better exec)", Default = false, Callback = function(v) CFG.AutoEnhance = v end })
+gLobby:AddToggle("T_AutoEnhance", { Text = "Auto Enhance Perk (needs getactors — no known exec)", Default = false, Tooltip = "Perk data lives in the character Actor VM; unreachable without getactors/run_on_actor, which Xeno and Real both lack. Left here in case a future executor adds it.", Callback = function(v) CFG.AutoEnhance = v end })
 gLobby:AddDropdown("D_PerkSlot", { Text = "Perk Slot to Enhance", Values = {"Defense","Support","Family","Extra","Offense","Body"}, Default = 6, Callback = function(v) CFG.PerkSlot = v end })
 gLobby:AddDropdown("D_FoodRarities", { Text = "Food Perk Rarities", Values = {"Common","Rare","Epic","Legendary"}, Default = {}, Multi = true, Callback = function(v)
     local r = {}
