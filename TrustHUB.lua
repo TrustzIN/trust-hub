@@ -180,6 +180,10 @@ local CFG = {
     -- v3.1: RamenHub integration
     AutoSkillTree=false, SkillTreePath="Blades", SkillTreeSub="Damage",
     SpearAutoFire=true, ShifterSkills=true,
+    -- v3.2: TITANIC hub integration (lobby automation)
+    AutoPrestige=false, PrestigeGoldM=0, PrestigeBoost="Luck Boost",
+    AutoEnhance=false, PerkSlot="Body", FoodRarities={},
+    AutoClaimAch=false,
 }
 local ST = {
     running=false, canHit=true, startT=tick(), lastKill=tick(),
@@ -757,54 +761,74 @@ local function bladeDurability()
     end
     return best
 end
-local function bladeSetsLeft()
+-- The HUD weapon section (Main.Top.7) holds both a "Blades" and a "Spears"
+-- frame; only the equipped one is Visible. Confirmed reliable (from the
+-- TITANIC hub) — a real weapon detector that works without the account data
+-- that Data/Copy won't give us in the lobby.
+local function weaponHUD()
     local pg = LP:FindFirstChild("PlayerGui")
     local iface = pg and pg:FindFirstChild("Interface")
     local hud = iface and iface:FindFirstChild("HUD")
     local main = hud and hud:FindFirstChild("Main")
     local top = main and main:FindFirstChild("Top")
-    local seven = top and top:FindFirstChild("7")
-    local blades = seven and seven:FindFirstChild("Blades")
-    local sets = blades and blades:FindFirstChild("Sets")
-    if not sets then return nil end
-    return tonumber((tostring(sets.Text or ""):match("(%d+)")))
+    return top and top:FindFirstChild("7")
 end
--- "Refill" BasePart farthest from any titan — so the station refill fires at
--- a spot away from danger rather than the nearest one (which may be swarmed).
-local function getSafestRefill()
-    local titans = {}
-    local tf = workspace:FindFirstChild("Titans")
-    if tf then
-        for _, t in ipairs(tf:GetChildren()) do
-            local p = t:FindFirstChild("HumanoidRootPart") or t:FindFirstChild("Torso") or t.PrimaryPart
-            if p then titans[#titans + 1] = p.Position end
+local function detectWeapon()
+    local seven = weaponHUD()
+    if not seven then return nil end
+    local b = seven:FindFirstChild("Blades")
+    local s = seven:FindFirstChild("Spears")
+    if b and b.Visible then return "Blades" end
+    if s and s.Visible then return "Spears" end
+    return nil
+end
+-- Spare sets ("X / Y") for the equipped weapon.
+local function weaponSetsLeft()
+    local seven = weaponHUD()
+    if not seven then return nil end
+    local w = detectWeapon()
+    local frame = w and seven:FindFirstChild(w)
+    local label = frame and (frame:FindFirstChild("Sets") or frame:FindFirstChild(w)) -- Blades.Sets / Spears.Spears
+    if not label then return nil end
+    return tonumber((tostring(label.Text or ""):match("(%d+)")))
+end
+-- Robust "Refill" station finder (from the TITANIC hub): the part lives under
+-- different parents per map, so check the known paths then fall back to a
+-- recursive search.
+local function getRefillPart()
+    local u = workspace:FindFirstChild("Unclimbable")
+    if not u then return nil end
+    local reloads = u:FindFirstChild("Reloads")
+    local gt = reloads and reloads:FindFirstChild("GasTanks")
+    if gt and gt:FindFirstChild("Refill") then return gt.Refill end
+    local props = u:FindFirstChild("Props")
+    local hq = props and props:FindFirstChild("HQ")
+    if hq then
+        local hgt = hq:FindFirstChild("GasTanks")
+        if hgt and hgt:FindFirstChild("Refill") then return hgt.Refill end
+        for _, c in ipairs(hq:GetChildren()) do
+            if c:FindFirstChild("Refill") then return c.Refill end
         end
     end
-    local best, bestScore
-    for _, o in ipairs(workspace:GetDescendants()) do
-        if o.Name == "Refill" and o:IsA("BasePart") then
-            local nearT = 1e9
-            for _, tp in ipairs(titans) do
-                local d = (o.Position - tp).Magnitude
-                if d < nearT then nearT = d end
-            end
-            if not bestScore or nearT > bestScore then bestScore = nearT; best = o end
-        end
-    end
-    return best
+    return u:FindFirstChild("Refill", true)
 end
 local function reloadLoop()
     local lastEmpty = false
     while ST.running do
         task.wait(0.5)
         if CFG.AutoReload and inMatch() then
-            pcall(function() GET:InvokeServer("Blades", "Reload") end) -- top up durability (no-op when full)
-            local sets = bladeSetsLeft()
+            -- Durability top-up: the server no-ops when the blade is full and
+            -- swaps a set when it's depleted, so blind-firing is safe.
+            pcall(function() GET:InvokeServer("Blades", "Reload") end)
+            -- Out of spare sets → refill at a station. Fire the no-arg form
+            -- (TITANIC) and the part form (our earlier working version) so at
+            -- least one lands regardless of what this map's handler expects.
+            local sets = weaponSetsLeft()
             local empty = (sets ~= nil and sets <= 0)
-            if empty and not lastEmpty then -- edge: out of spare sets → station refill
-                local refill = getSafestRefill()
+            if empty and not lastEmpty then
+                pcall(function() POST:FireServer("Attacks", "Reload") end)
+                local refill = getRefillPart()
                 if refill then
-                    pcall(function() POST:FireServer("Attacks", "Reload", refill) end)
                     pcall(function() POST:FireServer("Attacks", "Reload", refill) end)
                 end
             end
@@ -1131,58 +1155,61 @@ local function lobbyLoop()
             end
             task.wait(5)
         end
-        if CFG.AutoRetry then
-            -- Live-confirmed real end-of-mission screen:
-            -- PlayerGui.Interface.Rewards (CanvasGroup, .Visible toggles),
-            -- shows "MISSION COMPLETED" in Main.Info.State, with real
-            -- TextButtons Retry / Leave_2 / Modify under
-            -- Main.Info.Main.Buttons. Earlier approaches (i) clicked a
-            -- "Retry" button found by text-matching + called an unverified
-            -- "S_Missions"/"Retry" remote, neither of which existed, then
-            -- (ii) inferred "mission over" from Titans==0, which is also
-            -- briefly true between waves and false-fired mid-mission. This
-            -- reacts to the actual screen and clicks the actual button —
-            -- no heuristics, no guessed remotes.
+        do
+            -- Real end-of-mission screen: PlayerGui.Interface.Rewards
+            -- (CanvasGroup, .Visible toggles). Reward accounting + game count
+            -- run REGARDLESS of Auto Retry (so stats track even when you
+            -- retry manually); only the actual Retry/Leave click is gated on
+            -- CFG.AutoRetry. Everything is edge-guarded (ST.rewardsSeen) so it
+            -- fires exactly once per screen.
             local pg = LP:FindFirstChild("PlayerGui")
             local iface = pg and pg:FindFirstChild("Interface")
             local rewards = iface and iface:FindFirstChild("Rewards")
             if rewards and rewards.Visible then
-                if CFG.AutoChest then
+                if not ST.rewardsSeen then
+                    ST.rewardsSeen = true
+                    -- Exact payout from S_Rewards/Get(.Obtained) — the true
+                    -- gold/gems/XP, far better than diffing Topbar gold text.
                     pcall(function()
-                        for _, d in ipairs(pg:GetDescendants()) do
-                            if d:IsA("ProximityPrompt") and (d.ObjectText:lower():match("chest") or d.ActionText:lower():match("open")) then
-                                fireproximityprompt(d)
-                            end
+                        local res = GET:InvokeServer("S_Rewards", "Get", true)
+                        if res and res.Obtained then
+                            local ob = res.Obtained
+                            SESSION.goldEarned = SESSION.goldEarned + (tonumber(ob.Gold) or 0)
+                            SESSION.gemsEarned = (SESSION.gemsEarned or 0) + (tonumber(ob.Gems) or 0)
+                            SESSION.xpEarned   = (SESSION.xpEarned or 0) + (tonumber(ob.XP) or 0)
                         end
                     end)
-                    task.wait(1)
-                end
-                ST.gameCount = ST.gameCount + 1
-                local wantLeave = CFG.AutoReturn and ST.gameCount >= CFG.ReturnAfter
-                if wantLeave then ST.gameCount = 0 end
-                SESSION.gameCount = ST.gameCount
-                saveSession(SESSION)
-                -- Simulating the click (VIM mouse events, even with the
-                -- GuiInset offset fixed) only updated the button's local
-                -- visual state (turned green) without the server-side vote
-                -- ever registering — stayed stuck at "RETRY (0/1)". Traced
-                -- the real handlers instead (ReplicatedStorage.Modules.
-                -- Utilities.Interactions):
-                --   Retry: GET:InvokeServer("Functions", "Retry", "Add")
-                --   Leave: POST:FireServer("Functions", "Teleport")
-                -- No GUI interaction needed at all — these are the exact
-                -- calls the button's own click handler makes.
-                if wantLeave then
-                    ST.status = "Returning to lobby"
-                    pcall(function() POST:FireServer("Functions", "Teleport") end)
-                else
-                    ST.status = "Retrying mission"
-                    local ok, err = pcall(function() return GET:InvokeServer("Functions", "Retry", "Add") end)
-                    if not ok then
-                        warn("[Trust-HUB] Functions/Retry/Add failed: " .. tostring(err))
+                    if CFG.AutoChest then
+                        pcall(function()
+                            for _, d in ipairs(pg:GetDescendants()) do
+                                if d:IsA("ProximityPrompt") and (d.ObjectText:lower():match("chest") or d.ActionText:lower():match("open")) then
+                                    fireproximityprompt(d)
+                                end
+                            end
+                        end)
+                        task.wait(1)
+                    end
+                    ST.gameCount = ST.gameCount + 1
+                    local wantLeave = CFG.AutoReturn and ST.gameCount >= CFG.ReturnAfter
+                    if wantLeave then ST.gameCount = 0 end
+                    SESSION.gameCount = ST.gameCount
+                    saveSession(SESSION)
+                    -- Real handlers (Modules.Utilities.Interactions):
+                    --   Retry: GET:InvokeServer("Functions","Retry","Add")
+                    --   Leave: POST:FireServer("Functions","Teleport")
+                    if CFG.AutoRetry then
+                        if wantLeave then
+                            ST.status = "Returning to lobby"
+                            pcall(function() POST:FireServer("Functions", "Teleport") end)
+                        else
+                            ST.status = "Retrying mission"
+                            pcall(function() return GET:InvokeServer("Functions", "Retry", "Add") end)
+                        end
+                        task.wait(5)
                     end
                 end
-                task.wait(5) -- let the click register/transition before the next check
+            else
+                ST.rewardsSeen = false -- screen closed: re-arm for the next mission
             end
         end
         if CFG.FailSafe and (tick() - ST.lastKill) > (CFG.FailSafeMins * 60) then
@@ -1300,12 +1327,100 @@ local function autoSkillTreeCycle()
         task.wait(0.2)
     end
 end
+-- ══════════════════════════════════════════════════════════
+-- [15a] LOBBY AUTOMATION (v3.2 — prestige / perk enhance / achievements)
+-- ══════════════════════════════════════════════════════════
+-- Account-wide data (Slots/Perks/Currency) for lobby features. Returns nil if
+-- the server doesn't hand it over (it's flaky in the lobby) — callers no-op.
+local function getAccountData()
+    for _ = 1, 3 do
+        local ok, r = pcall(function() return GET:InvokeServer("Functions", "Settings", "Get") end)
+        if ok and type(r) == "table" and r.Slots then return r end
+        task.wait(0.4)
+    end
+    return nil
+end
+-- Perk name -> rarity, for filtering "food" perks when enhancing. Static data.
+local PERK_RARITY = {}
+do
+    local perksByRarity = {
+        Common = {"Cripple","Lucky","Enhanced Metabolism","First Aid","Mighty","Fortitude","Hollow","Gear Beginner","Enduring"},
+        Rare = {"Blessed","Gear Intermediate","Unyielding","Fully Stocked","Forceful","Lightweight","Protection","Mangle","Experimental Shells","Critical Hunter","Tough","Heightened Vitality"},
+        Epic = {"Munitions Expert","Gear Expert","Butcher","Resilient","Speedy","Reckless Abandon","Focus","Stalwart Durability","Adrenaline","Safeguard","Warrior","Solo","Mutilate","Trauma Battery","Hardy","Unbreakable","Siphoning","Flawed Release","Luminous","Peerless Strength"},
+        Legendary = {"Peerless Commander","Indefatigable","Tyrant's Stare","Invincible","Eviscerate","Font of Vitality","Flame Rhapsody","Robust","Sixth Sense","Gear Master","Carnifex","Munitions Master","Sanctified","Wind Rhapsody","Peerless Constitution","Exhumation","Warchief","Peerless Focus","Perfect Form","Courage Catalyst","Aegis","Unparalleled Strength","Perfect Soul"},
+    }
+    for rarity, names in pairs(perksByRarity) do
+        for _, n in ipairs(names) do PERK_RARITY[n] = rarity end
+    end
+end
+local PRESTIGE_TALENTS = {
+    "Blitzblade","Crescendo","Swiftshot","Surgeshot","Guardian","Deflectra","Mendmaster","Cooldown Blitz",
+    "Stalwart","Stormcharged","Aegisurge","Riposte","Lifefeed","Vitalize","Gem Fiend","Luck Boost","EXP Boost",
+    "Gold Boost","Furyforge","Quakestrike","Assassin","Amputation","Steel Frame","Resilience","Vengeflare",
+    "Flashstep","Omnirange","Tactician","Gambler","Overslash","Afterimages","Necromantic","Thanatophobia","Apotheosis","Bloodthief",
+}
+-- One prestige attempt: prestige only once gold clears the configured
+-- threshold. Tries each talent until the server accepts one.
+local function doAutoPrestige()
+    local data = getAccountData()
+    local slot = LP:GetAttribute("Slot")
+    local sd = slot and data and data.Slots and data.Slots[slot]
+    if not sd or not sd.Currency then return end
+    local gold = tonumber(sd.Currency.Gold) or 0
+    if gold < (CFG.PrestigeGoldM * 1e6) then return end
+    for _, talent in ipairs(PRESTIGE_TALENTS) do
+        local ok, res = pcall(function()
+            return GET:InvokeServer("S_Equipment", "Prestige", { Boosts = CFG.PrestigeBoost, Talents = talent })
+        end)
+        if ok and res then
+            if Library then Library:Notify("Prestiged (" .. CFG.PrestigeBoost .. " / " .. talent .. ")", 5) end
+            return
+        end
+        task.wait(0.1)
+    end
+end
+-- One perk-enhance pass: feed the equipped perk in CFG.PerkSlot with up to 5
+-- storage perks whose rarity is selected as food. Enhance payload is a dict
+-- {[perkId]=qty}, confirmed by the TITANIC hub.
+local function doAutoEnhance()
+    local data = getAccountData()
+    local slot = LP:GetAttribute("Slot")
+    local sd = slot and data and data.Slots and data.Slots[slot]
+    if not sd or not sd.Perks then return end
+    local equippedId = sd.Perks.Equipped and sd.Perks.Equipped[CFG.PerkSlot]
+    local storage = sd.Perks.Storage
+    if not equippedId or not storage then return end
+    local wantRarity = {}
+    for _, r in ipairs(CFG.FoodRarities) do wantRarity[r] = true end
+    local food, count = {}, 0
+    for perkId, tbl in pairs(storage) do
+        if count >= 5 then break end
+        if perkId ~= equippedId and wantRarity[PERK_RARITY[tbl.Name]] then
+            food[perkId] = 1
+            count = count + 1
+        end
+    end
+    if count == 0 then return end
+    local ok, res = pcall(function()
+        return GET:InvokeServer("S_Equipment", "Enhance", equippedId, food)
+    end)
+    if ok and res and Library then Library:Notify("Enhanced perk (+" .. count .. " food)", 3) end
+end
+-- One achievements-claim sweep (indices 1..70), from the TITANIC hub.
+local function doClaimAchievements()
+    local claimed = false
+    for i = 1, 70 do
+        local ok, res = pcall(function() return GET:InvokeServer("S_Achievements", "Claim", i) end)
+        if ok and res ~= nil then claimed = true end
+    end
+    if claimed and Library then Library:Notify("Claimed achievements", 3) end
+end
 local function upgradeLoop()
+    local lastAch = 0
     while ST.running do
         task.wait(15)
-        -- All three of these (skill points, skill tree, gear) only apply in
-        -- the lobby — skip the whole batch mid-mission so we don't fire dead
-        -- S_Equipment calls every 15s during a run.
+        -- All of these apply in the lobby only — skip the whole batch mid-run
+        -- so we don't fire dead S_Equipment calls during a mission.
         if not isInLobby() then continue end
         if CFG.AutoSpendSP then
             local ids = (CFG.SkillPath == "Support Skills") and SUPPORT_SKILL_IDS or BLADE_SKILL_IDS
@@ -1313,6 +1428,13 @@ local function upgradeLoop()
         end
         if CFG.AutoSkillTree then autoSkillTreeCycle() end
         if CFG.AutoUpGear then upgradeAllGear() end
+        if CFG.AutoEnhance then doAutoEnhance() end
+        if CFG.AutoPrestige then doAutoPrestige() end
+        -- Achievements change rarely — sweep at most once a minute.
+        if CFG.AutoClaimAch and tick() - lastAch > 60 then
+            lastAch = tick()
+            doClaimAchievements()
+        end
     end
 end
 -- ══════════════════════════════════════════════════════════
@@ -1364,7 +1486,7 @@ local function buildStatsPanel()
     sg.IgnoreGuiInset = true
     sg.Parent = pg
 
-    local labels = { "Status", "Session", "Kills (mission)", "Missions", "Gold earned", "Gold/Hour" }
+    local labels = { "Status", "Session", "Kills (mission)", "Missions", "Gold earned", "Gems earned", "Gold/Hour" }
     local TITLE_H, ROW_H = 24, 20
     local bodyH = #labels * ROW_H + 6
     local fullH = TITLE_H + bodyH
@@ -1491,19 +1613,14 @@ track(RunService.Heartbeat:Connect(function()
 
     statsPanel.Rows["Missions"].Text = "Missions: " .. tostring(ST.gameCount)
 
-    -- Gold earned = sum of POSITIVE balance changes only. Spending on gear
-    -- upgrades drops the balance, which we ignore, so the figure never goes
-    -- negative and reflects only what missions actually paid out.
-    local gold = readGold()
-    if gold then
-        if SESSION.lastGold and gold > SESSION.lastGold then
-            SESSION.goldEarned = SESSION.goldEarned + (gold - SESSION.lastGold)
-        end
-        SESSION.lastGold = gold
-        statsPanel.Rows["Gold earned"].Text = "Gold earned: " .. formatNumber(SESSION.goldEarned)
-        local perHour = elapsed > 5 and math.floor(SESSION.goldEarned / elapsed * 3600) or 0
-        statsPanel.Rows["Gold/Hour"].Text = "Gold/Hour: " .. formatNumber(perHour)
-    end
+    -- Gold/Gems/XP now come straight from the exact per-mission S_Rewards
+    -- payout accumulated at the rewards screen (see lobbyLoop) — no more
+    -- Topbar-diff guessing, which mis-tracked across the reload boundary and
+    -- couldn't tell mission income from spending.
+    statsPanel.Rows["Gold earned"].Text = "Gold earned: " .. formatNumber(SESSION.goldEarned)
+    statsPanel.Rows["Gems earned"].Text = "Gems earned: " .. formatNumber(SESSION.gemsEarned or 0)
+    local perHour = elapsed > 5 and math.floor(SESSION.goldEarned / elapsed * 3600) or 0
+    statsPanel.Rows["Gold/Hour"].Text = "Gold/Hour: " .. formatNumber(perHour)
 
     -- Persist the accumulating session every ~10s so a crash/close loses at
     -- most 10s of gold/time, without hammering the disk every second.
@@ -1745,6 +1862,21 @@ gAfkUp:AddDropdown("D_TreePath", { Text = "Tree Path", Values = {"Blades","Spear
     CFG.SkillTreeSub = subs[1] or "Damage"
 end})
 gAfkUp:AddDropdown("D_TreeSub", { Text = "Sub-Path", Values = treeSubValues, Default = 1, Callback = function(v) CFG.SkillTreeSub = v end })
+-- v3.2: lobby automation (prestige / perk enhance / achievements)
+local gLobby = TabAFK:AddRightGroupbox("Lobby Automation")
+gLobby:AddToggle("T_AutoClaimAch", { Text = "Auto Claim Achievements", Default = false, Callback = function(v) CFG.AutoClaimAch = v end })
+gLobby:AddDivider()
+gLobby:AddToggle("T_AutoPrestige", { Text = "Auto Prestige", Default = false, Callback = function(v) CFG.AutoPrestige = v end })
+gLobby:AddSlider("S_PrestigeGold", { Text = "Prestige at Gold (millions)", Default = 0, Min = 0, Max = 100, Rounding = 0, Callback = function(v) CFG.PrestigeGoldM = v end })
+gLobby:AddDropdown("D_PrestigeBoost", { Text = "Prestige Boost", Values = {"Luck Boost","EXP Boost","Gold Boost"}, Default = 1, Callback = function(v) CFG.PrestigeBoost = v end })
+gLobby:AddDivider()
+gLobby:AddToggle("T_AutoEnhance", { Text = "Auto Enhance Perk", Default = false, Callback = function(v) CFG.AutoEnhance = v end })
+gLobby:AddDropdown("D_PerkSlot", { Text = "Perk Slot to Enhance", Values = {"Defense","Support","Family","Extra","Offense","Body"}, Default = 6, Callback = function(v) CFG.PerkSlot = v end })
+gLobby:AddDropdown("D_FoodRarities", { Text = "Food Perk Rarities", Values = {"Common","Rare","Epic","Legendary"}, Default = {}, Multi = true, Callback = function(v)
+    local r = {}
+    for k, on in pairs(v) do if on then table.insert(r, k) end end
+    CFG.FoodRarities = r
+end})
 -- ═══ TAB: COMBAT ═══
 local TabCombat = Window:AddTab("Combat")
 local gFarm = TabCombat:AddLeftGroupbox("Farm Controls")
