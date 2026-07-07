@@ -322,6 +322,44 @@ end
 local function saveSession(s)
     pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(s)) end)
 end
+-- ══════════════════════════════════════════════════════════
+-- [5c] STICKY PER-ACCOUNT CONFIG (auto-save / auto-load)
+-- ══════════════════════════════════════════════════════════
+-- The LinoriaLib SaveManager needs a manual "Create config" + "Set as
+-- autoload" dance and was flaky after teleports. This replaces it with a
+-- sticky config: every setting change is written to TrustHUB_<Name>_Config
+-- and reloaded automatically on the next start/hop. Keyed on LP.Name so each
+-- account remembers ITS OWN farm — set account A to Breach, account B to
+-- Stall, and each reloads its own on every launch. No buttons, no clobbering.
+local CFG_FILE = "TrustHUB_" .. LP.Name .. "_Config.json"
+-- Loaded into a SEPARATE buffer, NOT merged into CFG yet: building the GUI
+-- fires every toggle's callback with its hardcoded Default, which would
+-- clobber a merged CFG. So we stash the saved values here and apply them
+-- AFTER the GUI is built (via SetValue, which updates both CFG and the menu).
+local SAVED_CFG = nil
+do
+    local ok, data = pcall(function()
+        if isfile and isfile(CFG_FILE) then return HttpService:JSONDecode(readfile(CFG_FILE)) end
+    end)
+    if ok and type(data) == "table" then SAVED_CFG = data end
+end
+local _cfgLastJSON = ""
+local cfgSaveArmed = false -- the auto-saver only starts after settings are restored
+local function saveCFG()
+    if not cfgSaveArmed then return end
+    pcall(function()
+        local j = HttpService:JSONEncode(CFG)
+        if j ~= _cfgLastJSON then
+            _cfgLastJSON = j
+            writefile(CFG_FILE, j)
+        end
+    end)
+end
+task.spawn(function()
+    -- stops when this hub instance is killed (kill() nils the global), so a
+    -- re-execute doesn't leave an old saver running alongside the new one.
+    while getgenv().TRUST_HUB do task.wait(3); saveCFG() end
+end)
 -- A genuine cold launch must start a fresh session; a teleport hop must
 -- continue the existing one. queue_on_teleport's payload only runs after a
 -- REAL teleport lands (never on a plain autoexec/manual run), so it arms a
@@ -2393,11 +2431,56 @@ ThemeManager:SetLibrary(Library)
 ThemeManager:SetFolder("TrustHUB")
 ThemeManager:ApplyToTab(TabSettings)
 ThemeManager:ApplyTheme("Tokyo Night") -- switchable later from the Settings tab
+-- Push the sticky-loaded CFG into the GUI so the toggles/dropdowns/sliders
+-- visually match what was restored (behavior already follows CFG directly;
+-- this just keeps the menu in sync). Multi-selects (Modifiers, Food) are
+-- skipped — their behavior reads CFG straight, and re-syncing multi values is
+-- fiddly. SetValue fires the callbacks, which is harmless (idempotent).
+do
+    local togMap = {
+        T_AutoFarm="AutoFarm", T_RaidMode="RaidMode", T_AutoReload="AutoReload", T_AutoEscape="AutoEscape",
+        T_SafeFarm="SafeFarm", T_MultiTarget="MultiTarget", T_NapeExt="NapeExtend", T_RoarDodge="RoarDodge",
+        T_WeaponAuto="WeaponAutoDetect", T_ObjTrack="ObjectiveTracking", T_StallMode="StallMode",
+        T_TitanMastery="TitanMastery", T_AutoShift="AutoShift", T_ShifterSkills="ShifterSkills", T_SpearFire="SpearAutoFire",
+        T_Noclip="Noclip", T_TitanESP="TitanESP", T_BossESP="BossESP", T_RemoveFog="RemoveFog", T_DeleteMap="DeleteMap",
+        T_InjuryRem="InjuryRemove", T_KillNotif="KillNotif", T_Disable3D="Disable3D", T_AutoStart="AutoStart",
+        T_SoloOnly="SoloOnly", T_AutoRetry="AutoRetry", T_AutoReturn="AutoReturn", T_AutoDiff="AutoDifficulty",
+        T_AutoSkip="AutoSkip", T_AutoChest="AutoChest", T_FailSafe="FailSafe", T_BanCheck="BanCheckOnLoad",
+        T_AutoUpGear="AutoUpGear", T_AutoSP="AutoSpendSP", T_AutoSkillTree="AutoSkillTree", T_AutoClaimAch="AutoClaimAch",
+        T_AutoPrestige="AutoPrestige", T_AutoEnhance="AutoEnhance", T_AutoRejoin="AutoRejoin", T_AutoSelectSlot="AutoSelectSlot",
+        T_AutoBoostedMap="AutoBoostedMap", T_AutoModifiers="AutoModifiers", T_DieAtStreak="DieAtStreak",
+        T_StatsPanel="ShowStatsPanel", T_PersistReload="PersistReload", T_RewardWebhook="RewardWebhook",
+        T_MythicalWebhook="MythicalWebhook", T_DropLog="DropLog", T_SessionReport="SessionReport",
+    }
+    local optMap = {
+        D_DmgMode="DamageMode", D_MoveMode="MoveMode", D_MasteryMode="MasteryMode", D_StartType="StartType",
+        D_MapName="MapName", D_Objective="Objective", D_Difficulty="Difficulty", D_SkillPath="SkillPath",
+        D_TreePath="SkillTreePath", D_TreeSub="SkillTreeSub", D_PrestigeBoost="PrestigeBoost", D_PerkSlot="PerkSlot",
+        D_SelectSlot="SelectSlot", I_WebhookURL="WebhookURL",
+        S_ReturnAfter="ReturnAfter", S_StartDelay="StartDelay", S_FailSafe="FailSafeMins", S_AtkRange="AttackRange",
+        S_MultiTargetN="MultiTargetN", S_NapeSize="NapeExtSize", S_Height="FloatHeight", S_Speed="HoverSpeed",
+        S_PrestigeGold="PrestigeGoldM", S_DieStreak="DieStreakN", S_ReportMins="ReportMins",
+    }
+    if SAVED_CFG then
+        for optKey, cfgKey in pairs(togMap) do
+            local v = SAVED_CFG[cfgKey]
+            if Toggles[optKey] and type(v) == "boolean" then pcall(function() Toggles[optKey]:SetValue(v) end) end
+        end
+        for optKey, cfgKey in pairs(optMap) do
+            local v = SAVED_CFG[cfgKey]
+            if Options[optKey] and v ~= nil then pcall(function() Options[optKey]:SetValue(v) end) end
+        end
+        -- Non-GUI-synced keys (multi-selects, arrays) — apply straight to CFG.
+        if type(SAVED_CFG.Modifiers) == "table" then CFG.Modifiers = SAVED_CFG.Modifiers end
+        if type(SAVED_CFG.FoodRarities) == "table" then CFG.FoodRarities = SAVED_CFG.FoodRarities end
+    end
+    cfgSaveArmed = true -- settings restored; now it's safe to auto-save changes
+end
 -- ══════════════════════════════════════════════════════════
 -- [19] STARTUP
 -- ══════════════════════════════════════════════════════════
 masterStart()
-Library:Notify("Trust-HUB v3.0 loaded! | by ENI x LO | User: " .. LP.Name, 5)
+Library:Notify("⚔️ TRUST-HUB v2.0 loaded | " .. LP.Name, 5)
 print(string.format("[Trust-HUB v3.0] Loaded in %.2fs | Titans: %d",
     tick() - ST.startT,
     #(workspace:FindFirstChild("Titans") and workspace.Titans:GetChildren() or {})
