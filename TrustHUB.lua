@@ -190,6 +190,7 @@ local CFG = {
     DieAtStreak=false, DieStreakN=10000,
     -- v2.0: user-configured webhook
     WebhookURL="", RewardWebhook=false, MythicalWebhook=false,
+    DropLog=false, SessionReport=false, ReportMins=30,
 }
 local ST = {
     running=false, canHit=true, startT=tick(), lastKill=tick(),
@@ -284,6 +285,23 @@ local function sendWebhook(embed, content)
     task.spawn(function()
         httpRequest({ Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
     end)
+end
+-- Formatting helpers (defined early so the webhook/report loops can use them).
+local function formatDuration(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor((seconds % 3600) / 60)
+    local s = math.floor(seconds % 60)
+    return string.format("%02d:%02d:%02d", h, m, s)
+end
+-- Compact number: 1234 -> "1.2K", 3450000 -> "3.4M".
+local function formatNumber(n)
+    n = tonumber(n) or 0
+    local neg = n < 0 and "-" or ""
+    n = math.abs(n)
+    if n >= 1e9 then return string.format("%s%.2fB", neg, n / 1e9) end
+    if n >= 1e6 then return string.format("%s%.2fM", neg, n / 1e6) end
+    if n >= 1e3 then return string.format("%s%.1fK", neg, n / 1e3) end
+    return neg .. tostring(math.floor(n))
 end
 local SESSION_FILE = "TrustHUB_" .. LP.Name .. "_Session.json"
 local function loadSession()
@@ -1216,24 +1234,38 @@ local function lobbyLoop()
                         end
                     end)
                     -- Webhook: send the payout to the user's configured Discord.
-                    if CFG.RewardWebhook or CFG.MythicalWebhook then
-                        -- Detect a mythical/secret drop by the red rarity tint
-                        -- on the rewards item frames (same signal the game uses).
-                        local special = {}
+                    if CFG.RewardWebhook or CFG.MythicalWebhook or CFG.DropLog then
+                        -- Red rarity tint = mythical/secret. Also collect every
+                        -- item name from the rewards frames for the drop log.
+                        local special, allDrops = {}, {}
                         pcall(function()
                             local itemsFrame = rewards.Main.Info.Main.Items
                             for _, v in ipairs(itemsFrame:GetChildren()) do
                                 local inner = v:IsA("Frame") and v:FindFirstChild("Main") and v.Main:FindFirstChild("Inner")
-                                if inner and inner:FindFirstChild("Rarity") and inner.Rarity.BackgroundColor3 == Color3.fromRGB(255, 0, 0) then
-                                    special[#special + 1] = (tostring(v.Name):gsub("_", " "))
+                                if inner then
+                                    local nm = (tostring(v.Name):gsub("_", " "))
+                                    local qty = inner:FindFirstChild("Quantity")
+                                    allDrops[#allDrops + 1] = nm .. (qty and (" x" .. tostring(qty.Text)) or "")
+                                    if inner:FindFirstChild("Rarity") and inner.Rarity.BackgroundColor3 == Color3.fromRGB(255, 0, 0) then
+                                        special[#special + 1] = nm
+                                    end
                                 end
                             end
                         end)
                         local hasSpecial = #special > 0
+                        local g  = ob and ob.Gold or 0
+                        local gm = ob and ob.Gems or 0
+                        local xp = ob and ob.XP or 0
+                        -- Full drop log (every mission) — separate embed.
+                        if CFG.DropLog and #allDrops > 0 then
+                            sendWebhook({
+                                title = "📦 Drop Log",
+                                description = "**" .. LP.Name .. "**\n" .. table.concat(allDrops, "\n"),
+                                color = 8421504,
+                            })
+                        end
+                        -- Reward summary / mythical ping.
                         if CFG.RewardWebhook or (hasSpecial and CFG.MythicalWebhook) then
-                            local g = ob and ob.Gold or 0
-                            local gm = ob and ob.Gems or 0
-                            local xp = ob and ob.XP or 0
                             local desc = ("**User:** %s\n**Gold:** %s\n**Gems:** %s\n**XP:** %s"):format(LP.Name, tostring(g), tostring(gm), tostring(xp))
                             if hasSpecial then desc = desc .. "\n**🔥 Special:** " .. table.concat(special, ", ") end
                             sendWebhook({
@@ -1534,6 +1566,26 @@ end
 -- desynced/crashed — teleport back through the lobby to recover. This is the
 -- single biggest reliability win for unattended multi-account farming (a
 -- crashed client otherwise sits dead forever). Ported from the TITANIC hub.
+-- Periodic session report to the webhook (gold/hour, games, totals). Fires
+-- every CFG.ReportMins minutes while enabled + a URL is set.
+local function sessionReportLoop()
+    local nextReport = tick() + (CFG.ReportMins * 60)
+    while ST.running do
+        task.wait(15)
+        if not CFG.SessionReport or CFG.WebhookURL == "" then
+            nextReport = tick() + (CFG.ReportMins * 60)
+        elseif tick() >= nextReport then
+            nextReport = tick() + (CFG.ReportMins * 60)
+            local el = math.max(os.time() - SESSION.sessionStart, 1)
+            local perHr = math.floor(SESSION.goldEarned / el * 3600)
+            local desc = ("**User:** %s\n**Session:** %s\n**Missions:** %d\n**Gold:** %s (%s/hr)\n**Gems:** %s\n**XP:** %s"):format(
+                LP.Name, formatDuration(el), SESSION.gameCount,
+                formatNumber(SESSION.goldEarned), formatNumber(perHr),
+                formatNumber(SESSION.gemsEarned or 0), formatNumber(SESSION.xpEarned or 0))
+            sendWebhook({ title = "📊 Session Report", description = desc, color = 5793266 })
+        end
+    end
+end
 local function crashRejoinLoop()
     while ST.running do
         task.wait(10)
@@ -1833,23 +1885,6 @@ local function buildStatsPanel()
 
     statsPanel = { Gui = sg, Rows = rows }
 end
-local function formatDuration(seconds)
-    local h = math.floor(seconds / 3600)
-    local m = math.floor((seconds % 3600) / 60)
-    local s = math.floor(seconds % 60)
-    return string.format("%02d:%02d:%02d", h, m, s)
-end
--- Compact number: 1234 -> "1.2K", 3450000 -> "3.4M". Keeps the panel readable
--- once gold/hour reaches the hundred-thousands on a long farm.
-local function formatNumber(n)
-    n = tonumber(n) or 0
-    local neg = n < 0 and "-" or ""
-    n = math.abs(n)
-    if n >= 1e9 then return string.format("%s%.2fB", neg, n / 1e9) end
-    if n >= 1e6 then return string.format("%s%.2fM", neg, n / 1e6) end
-    if n >= 1e3 then return string.format("%s%.1fK", neg, n / 1e3) end
-    return neg .. tostring(math.floor(n))
-end
 local lastStatsUpdate = 0
 local lastSessionSave = 0
 track(RunService.Heartbeat:Connect(function()
@@ -2011,6 +2046,7 @@ local function masterStart()
     trackThread(reloadLoop) -- blade durability + set refill
     trackThread(crashRejoinLoop) -- multi-account: recover a crashed mission
     trackThread(boostedMapLoop) -- auto-join the 2x boosted map
+    trackThread(sessionReportLoop) -- periodic webhook session report
     -- Ban-attribute clearing already happens reactively via the
     -- AttributeChanged connection set up in [2]; a second 0.5s polling loop
     -- doing the exact same clear on the exact same attribute list was pure
@@ -2263,6 +2299,9 @@ gWebhook:AddInput("I_WebhookURL", {
 })
 gWebhook:AddToggle("T_RewardWebhook", { Text = "Send Every Reward", Default = false, Tooltip = "Post gold/gems/XP to your webhook after every mission", Callback = function(v) CFG.RewardWebhook = v end })
 gWebhook:AddToggle("T_MythicalWebhook", { Text = "Ping on Mythical/Secret Drop", Default = false, Tooltip = "@everyone ping when a red-rarity (mythical/secret) item drops", Callback = function(v) CFG.MythicalWebhook = v end })
+gWebhook:AddToggle("T_DropLog", { Text = "Full Drop Log", Default = false, Tooltip = "Log EVERY item dropped each mission (separate message)", Callback = function(v) CFG.DropLog = v end })
+gWebhook:AddToggle("T_SessionReport", { Text = "Periodic Session Report", Default = false, Tooltip = "Post a gold/hour + totals summary every X minutes", Callback = function(v) CFG.SessionReport = v end })
+gWebhook:AddSlider("S_ReportMins", { Text = "Report every (min)", Default = 30, Min = 5, Max = 180, Rounding = 0, Callback = function(v) CFG.ReportMins = v end })
 gWebhook:AddButton({ Text = "Send Test Message", Func = function()
     if not CFG.WebhookURL or CFG.WebhookURL == "" then
         Library:Notify("Paste a webhook URL first", 4)
