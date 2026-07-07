@@ -357,24 +357,27 @@ end
 -- manual copy to the 3 local files needed for that account. Falls back to
 -- the local Trust_HUB.lua copy if the fetch fails (offline, repo down, etc).
 local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/TrustzIN/trust-hub/master/TrustHUB.lua"
+-- MULTI-ACCOUNT STABILITY: the teleport payload now loads the LOCAL cached
+-- copy FIRST and only hits the network if it's missing. The old version did a
+-- fresh game:HttpGet of the whole ~130KB script on EVERY teleport — with 3-4
+-- clients all hopping, that's constant synchronous network + a fresh 130KB
+-- compile per hop hammering Xeno's bytecode-patch watcher (the thing that
+-- auto-closes clients). Reading the local file is instant and offline. You
+-- still get updates: a cold launch runs the autoexec copy, and pushing a new
+-- version + reloading once refreshes the local file. (Trades "auto-update on
+-- every hop" for not crashing 4 clients — the stability the user needs.)
 local function registerTeleportReload()
     if not CFG.PersistReload then return end
     pcall(function()
         queue_on_teleport(([[
             pcall(function() writefile(%q, "1") end)
-            -- A truncated/corrupted HTTP body still counts as a "successful"
-            -- HttpGet (ok=true) — that only failed at loadstring() with
-            -- "bytecode corrupted", past this local fallback entirely since
-            -- it only triggered on the fetch itself failing. Wrap the
-            -- compile-and-run in its own pcall so a bad download still falls
-            -- through to the local copy instead of just erroring out.
-            local ok, src = pcall(function() return game:HttpGet(%q) end)
             local ran = false
-            if ok and src and #src > 0 then
-                ran = pcall(function() loadstring(src)() end)
+            if readfile and isfile and isfile("Trust_HUB.lua") then
+                ran = pcall(function() loadstring(readfile("Trust_HUB.lua"))() end)
             end
-            if not ran and readfile and isfile and isfile("Trust_HUB.lua") then
-                loadstring(readfile("Trust_HUB.lua"))()
+            if not ran then
+                local ok, src = pcall(function() return game:HttpGet(%q) end)
+                if ok and src and #src > 0 then pcall(function() loadstring(src)() end) end
             end
         ]]):format(TELEPORT_MARKER_FILE, REMOTE_SCRIPT_URL))
     end)
@@ -865,9 +868,15 @@ local function reloadLoop()
     while ST.running do
         task.wait(0.5)
         if CFG.AutoReload and inMatch() then
-            -- Durability top-up: the server no-ops when the blade is full and
-            -- swaps a set when it's depleted, so blind-firing is safe.
-            pcall(function() GET:InvokeServer("Blades", "Reload") end)
+            -- Durability top-up. Only fire when the blade is actually running
+            -- low (HUD bar read) instead of blind-spamming the InvokeServer
+            -- every 0.5s — that blocking round-trip, times 3-4 accounts, is a
+            -- real load. bladeDurability() is nil when it can't read (spears,
+            -- respawning) → fire anyway as a safe fallback.
+            local dur = bladeDurability()
+            if dur == nil or dur <= 3 then
+                pcall(function() GET:InvokeServer("Blades", "Reload") end)
+            end
             -- Out of spare sets → refill at a station. Fire the no-arg form
             -- (TITANIC) and the part form (our earlier working version) so at
             -- least one lands regardless of what this map's handler expects.
@@ -2063,9 +2072,23 @@ end
 -- [18] OBSIDIAN UI
 -- ══════════════════════════════════════════════════════════
 local repo = 'https://raw.githubusercontent.com/mstudio45/LinoriaLib/refs/heads/main/'
-Library      = loadstring(game:HttpGet(repo .. 'Library.lua'))() -- assigns the forward-declared upvalue, not a new local
-local ThemeManager = loadstring(game:HttpGet(repo .. 'addons/ThemeManager.lua'))()
-local SaveManager  = loadstring(game:HttpGet(repo .. 'addons/SaveManager.lua'))()
+-- Disk-cache the UI libs: fetch once (first ever load), save, then load from
+-- disk forever after. Cuts 3 synchronous game:HttpGet round-trips off every
+-- single load/teleport — a real per-instance cost when 3-4 clients all reload
+-- on hop. Only re-downloads if the cache is missing.
+local function fetchLib(name, url)
+    local path = "TrustHUB_lib_" .. name .. ".lua"
+    local src
+    pcall(function() if isfile and isfile(path) then src = readfile(path) end end)
+    if not src or #src < 100 then
+        src = game:HttpGet(url)
+        pcall(function() if writefile then writefile(path, src) end end)
+    end
+    return loadstring(src)()
+end
+Library      = fetchLib("Library", repo .. 'Library.lua') -- assigns the forward-declared upvalue
+local ThemeManager = fetchLib("Theme", repo .. 'addons/ThemeManager.lua')
+local SaveManager  = fetchLib("Save", repo .. 'addons/SaveManager.lua')
 local Window = Library:CreateWindow({
     Title    = "⚔️ TRUST-HUB v2.0 | " .. LP.Name,
     Center   = true,
