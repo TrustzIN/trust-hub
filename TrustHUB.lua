@@ -1619,7 +1619,8 @@ local function readMissionKillsText()
     return slay and slay.Text or nil -- e.g. "Slay Titans [10/44]"
 end
 local statsPanel
-local ACCENT = Color3.fromRGB(103, 89, 179) -- Tokyo Night accent, shared
+local ACCENT = Color3.fromRGB(139, 122, 255) -- brighter Tokyo Night accent
+local ACCENT2 = Color3.fromRGB(90, 70, 200)
 local function buildStatsPanel()
     local pg = LP:FindFirstChild("PlayerGui")
     if not pg then return end
@@ -1629,83 +1630,143 @@ local function buildStatsPanel()
     sg.Name = "TrustHUB_StatsPanel"
     sg.ResetOnSpawn = false
     sg.IgnoreGuiInset = true
+    sg.DisplayOrder = 50
     sg.Parent = pg
 
-    local labels = { "Status", "Session", "Kills (mission)", "Missions", "Gold earned", "Gems earned", "XP earned", "Gold/Hour" }
-    local TITLE_H, ROW_H = 24, 20
-    local bodyH = #labels * ROW_H + 6
-    local fullH = TITLE_H + bodyH
+    -- label -> {emoji icon, is-status?}
+    local rowDefs = {
+        { "Status",          "🟢" },
+        { "Session",         "⏱️" },
+        { "Kills (mission)", "⚔️" },
+        { "Missions",        "🗺️" },
+        { "Gold earned",     "🪙" },
+        { "Gems earned",     "💎" },
+        { "XP earned",       "✨" },
+        { "Gold/Hour",       "📈" },
+    }
+    local HEAD_H, ROW_H, PAD = 30, 22, 6
+    local WIDTH = 244
+    local bodyH = #rowDefs * ROW_H + PAD * 2
+    local fullH = HEAD_H + bodyH
+
+    -- soft drop shadow behind the panel
+    local shadow = Instance.new("ImageLabel", sg)
+    shadow.BackgroundTransparency = 1
+    shadow.Image = "rbxassetid://5554236805"
+    shadow.ScaleType = Enum.ScaleType.Slice
+    shadow.SliceCenter = Rect.new(23, 23, 277, 277)
+    shadow.ImageColor3 = Color3.fromRGB(0, 0, 0)
+    shadow.ImageTransparency = 0.35
+    shadow.Size = UDim2.new(0, WIDTH + 30, 0, fullH + 30)
 
     local frame = Instance.new("Frame", sg)
-    frame.Size = UDim2.new(0, 230, 0, fullH)
-    frame.Position = UDim2.new(1, -242, 0, 90)
-    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-    frame.BackgroundTransparency = 0.25
+    frame.Size = UDim2.new(0, WIDTH, 0, fullH)
+    frame.Position = UDim2.new(1, -(WIDTH + 14), 0, 90)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+    frame.BackgroundTransparency = 0.1
     frame.BorderSizePixel = 0
     frame.Active = true
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
     local stroke = Instance.new("UIStroke", frame)
     stroke.Color = ACCENT
-    stroke.Thickness = 1
+    stroke.Thickness = 1.4
+    stroke.Transparency = 0.2
+    -- keep the shadow glued behind the frame
+    local function syncShadow() shadow.Position = UDim2.new(frame.Position.X.Scale, frame.Position.X.Offset - 15, frame.Position.Y.Scale, frame.Position.Y.Offset - 15) end
+    syncShadow()
 
-    -- Title bar doubles as the drag handle.
-    local titleBar = Instance.new("TextButton", frame)
-    titleBar.Size = UDim2.new(1, 0, 0, TITLE_H)
-    titleBar.BackgroundTransparency = 1
-    titleBar.AutoButtonColor = false
-    titleBar.Text = "  TRUST-HUB"
-    titleBar.Font = Enum.Font.GothamBold
-    titleBar.TextSize = 14
-    titleBar.TextXAlignment = Enum.TextXAlignment.Left
-    titleBar.TextColor3 = Color3.fromRGB(200, 190, 255)
+    -- gradient header (drag handle)
+    local header = Instance.new("TextButton", frame)
+    header.Size = UDim2.new(1, 0, 0, HEAD_H)
+    header.BorderSizePixel = 0
+    header.AutoButtonColor = false
+    header.Text = ""
+    header.BackgroundColor3 = ACCENT2
+    Instance.new("UICorner", header).CornerRadius = UDim.new(0, 10)
+    local hgrad = Instance.new("UIGradient", header)
+    hgrad.Color = ColorSequence.new(ACCENT2, ACCENT)
+    hgrad.Rotation = 12
+    -- flatten the header's bottom corners (cover the rounded bottom)
+    local hFix = Instance.new("Frame", header)
+    hFix.BackgroundColor3 = ACCENT2
+    hFix.BorderSizePixel = 0
+    hFix.Size = UDim2.new(1, 0, 0.5, 0)
+    hFix.Position = UDim2.new(0, 0, 0.5, 0)
+    local hFixGrad = Instance.new("UIGradient", hFix)
+    hFixGrad.Color = ColorSequence.new(ACCENT2, ACCENT)
+    hFixGrad.Rotation = 12
 
-    -- Minimize button collapses to just the title bar.
-    local minBtn = Instance.new("TextButton", frame)
-    minBtn.Size = UDim2.new(0, 24, 0, TITLE_H)
-    minBtn.Position = UDim2.new(1, -26, 0, 0)
+    local hTitle = Instance.new("TextLabel", header)
+    hTitle.BackgroundTransparency = 1
+    hTitle.Position = UDim2.new(0, 12, 0, 0)
+    hTitle.Size = UDim2.new(1, -44, 1, 0)
+    hTitle.Font = Enum.Font.GothamBold
+    hTitle.TextSize = 15
+    hTitle.TextXAlignment = Enum.TextXAlignment.Left
+    hTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    hTitle.Text = "⚔️  TRUST-HUB"
+
+    local minBtn = Instance.new("TextButton", header)
+    minBtn.Size = UDim2.new(0, 30, 1, 0)
+    minBtn.Position = UDim2.new(1, -30, 0, 0)
     minBtn.BackgroundTransparency = 1
     minBtn.Text = "–"
     minBtn.Font = Enum.Font.GothamBold
-    minBtn.TextSize = 18
-    minBtn.TextColor3 = Color3.fromRGB(200, 190, 255)
+    minBtn.TextSize = 20
+    minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 
     local body = Instance.new("Frame", frame)
     body.Size = UDim2.new(1, 0, 0, bodyH)
-    body.Position = UDim2.new(0, 0, 0, TITLE_H)
+    body.Position = UDim2.new(0, 0, 0, HEAD_H)
     body.BackgroundTransparency = 1
 
     local rows = {}
-    for i, label in ipairs(labels) do
-        local row = Instance.new("TextLabel", body)
-        row.BackgroundTransparency = 1
-        row.Size = UDim2.new(1, -16, 0, 18)
-        row.Position = UDim2.new(0, 8, 0, (i - 1) * ROW_H)
-        row.Font = Enum.Font.Gotham
-        row.TextSize = 13
-        row.TextXAlignment = Enum.TextXAlignment.Left
-        row.TextColor3 = (label == "Status") and Color3.fromRGB(150, 220, 150) or Color3.fromRGB(230, 230, 230)
-        row.Text = label .. ": --"
-        rows[label] = row
+    for i, def in ipairs(rowDefs) do
+        local label, icon = def[1], def[2]
+        local isStatus = (label == "Status")
+        local rowY = PAD + (i - 1) * ROW_H
+
+        -- left: icon + name
+        local name = Instance.new("TextLabel", body)
+        name.BackgroundTransparency = 1
+        name.Position = UDim2.new(0, 12, 0, rowY)
+        name.Size = UDim2.new(0.6, -12, 0, ROW_H - 3)
+        name.Font = Enum.Font.Gotham
+        name.TextSize = 13
+        name.TextXAlignment = Enum.TextXAlignment.Left
+        name.TextColor3 = Color3.fromRGB(170, 170, 190)
+        name.Text = icon .. "  " .. label:gsub(" %(mission%)", "")
+
+        -- right: value (accent/bold)
+        local value = Instance.new("TextLabel", body)
+        value.BackgroundTransparency = 1
+        value.Position = UDim2.new(0.6, 0, 0, rowY)
+        value.Size = UDim2.new(0.4, -12, 0, ROW_H - 3)
+        value.Font = Enum.Font.GothamBold
+        value.TextSize = 13
+        value.TextXAlignment = Enum.TextXAlignment.Right
+        value.TextColor3 = isStatus and Color3.fromRGB(150, 230, 150) or Color3.fromRGB(235, 235, 245)
+        value.Text = "--"
+        rows[label] = { Value = value }
     end
 
     local minimized = false
     minBtn.MouseButton1Click:Connect(function()
         minimized = not minimized
         body.Visible = not minimized
-        frame.Size = UDim2.new(0, 230, 0, minimized and TITLE_H or fullH)
+        shadow.Visible = not minimized
+        frame.Size = UDim2.new(0, WIDTH, 0, minimized and HEAD_H or fullH)
         minBtn.Text = minimized and "+" or "–"
     end)
 
-    -- Drag: standard UDim2-offset drag anchored to where the grab started.
+    -- Drag via the header.
     local dragging, dragStart, startPos
-    titleBar.InputBegan:Connect(function(input)
+    header.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = frame.Position
+            dragging = true; dragStart = input.Position; startPos = frame.Position
         end
     end)
-    titleBar.InputEnded:Connect(function(input)
+    header.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = false
         end
@@ -1714,6 +1775,7 @@ local function buildStatsPanel()
         if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
             frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            syncShadow()
         end
     end))
 
@@ -1746,27 +1808,36 @@ track(RunService.Heartbeat:Connect(function()
     if now - lastStatsUpdate < 1 then return end
     lastStatsUpdate = now
 
-    statsPanel.Rows["Status"].Text = "Status: " .. (ST.status or "Idle")
+    do
+        local st = ST.status or "Idle"
+        local sv = statsPanel.Rows["Status"].Value
+        sv.Text = st
+        if st:find("Farm") or st:find("Attack") then
+            sv.TextColor3 = Color3.fromRGB(120, 230, 120)
+        elseif st:find("Reload") or st:find("Wait") or st:find("Start") or st:find("Retry") or st:find("Return") then
+            sv.TextColor3 = Color3.fromRGB(240, 200, 110)
+        else
+            sv.TextColor3 = Color3.fromRGB(180, 180, 200)
+        end
+    end
 
     -- Real wall-clock elapsed (survives hops) — not tick(), which is per-Lua
     -- state and resets to ~0 every reload.
     local elapsed = os.time() - SESSION.sessionStart
-    statsPanel.Rows["Session"].Text = "Session: " .. formatDuration(elapsed)
+    statsPanel.Rows["Session"].Value.Text = formatDuration(elapsed)
 
     local slayText = readMissionKillsText()
-    statsPanel.Rows["Kills (mission)"].Text = "Kills (mission): " .. (slayText and slayText:match("%[(.-)%]") or "--")
+    statsPanel.Rows["Kills (mission)"].Value.Text = (slayText and slayText:match("%[(.-)%]") or "--")
 
-    statsPanel.Rows["Missions"].Text = "Missions: " .. tostring(ST.gameCount)
+    statsPanel.Rows["Missions"].Value.Text = tostring(ST.gameCount)
 
-    -- Gold/Gems/XP now come straight from the exact per-mission S_Rewards
-    -- payout accumulated at the rewards screen (see lobbyLoop) — no more
-    -- Topbar-diff guessing, which mis-tracked across the reload boundary and
-    -- couldn't tell mission income from spending.
-    statsPanel.Rows["Gold earned"].Text = "Gold earned: " .. formatNumber(SESSION.goldEarned)
-    statsPanel.Rows["Gems earned"].Text = "Gems earned: " .. formatNumber(SESSION.gemsEarned or 0)
-    statsPanel.Rows["XP earned"].Text = "XP earned: " .. formatNumber(SESSION.xpEarned or 0)
+    -- Gold/Gems/XP come straight from the exact per-mission S_Rewards payout
+    -- accumulated at the rewards screen (see lobbyLoop).
+    statsPanel.Rows["Gold earned"].Value.Text = formatNumber(SESSION.goldEarned)
+    statsPanel.Rows["Gems earned"].Value.Text = formatNumber(SESSION.gemsEarned or 0)
+    statsPanel.Rows["XP earned"].Value.Text = formatNumber(SESSION.xpEarned or 0)
     local perHour = elapsed > 5 and math.floor(SESSION.goldEarned / elapsed * 3600) or 0
-    statsPanel.Rows["Gold/Hour"].Text = "Gold/Hour: " .. formatNumber(perHour)
+    statsPanel.Rows["Gold/Hour"].Value.Text = formatNumber(perHour)
 
     -- Persist the accumulating session every ~10s so a crash/close loses at
     -- most 10s of gold/time, without hammering the disk every second.
@@ -1908,7 +1979,7 @@ Library      = loadstring(game:HttpGet(repo .. 'Library.lua'))() -- assigns the 
 local ThemeManager = loadstring(game:HttpGet(repo .. 'addons/ThemeManager.lua'))()
 local SaveManager  = loadstring(game:HttpGet(repo .. 'addons/SaveManager.lua'))()
 local Window = Library:CreateWindow({
-    Title    = "Trust-HUB v3.0 | " .. LP.Name,
+    Title    = "⚔️ TRUST-HUB v2.0 | " .. LP.Name,
     Center   = true,
     AutoShow = true,
     UnlockMouseWhileOpen = true, -- library defaults this true, but the game's own ODM
@@ -1971,6 +2042,48 @@ local gForce = TabFarm:AddRightGroupbox("Manual")
 gForce:AddButton({ Text = "Force Return to Lobby", Func = function() pcall(function() GET:InvokeServer("Functions", "Teleport", "Lobby") end) end })
 gForce:AddButton({ Text = "Upgrade Gear Now", Func = function() upgradeAllGear() end })
 gForce:AddButton({ Text = "EMERGENCY STOP", Func = function() masterStop(); Library:Notify("EMERGENCY STOP!", 5) end })
+-- v2.0: one-click AFK presets. Each sets the whole config in the right order
+-- (type/map before objective, since the objective list depends on the map).
+local ALL_MODS = {}
+for _, name in ipairs(modMap) do ALL_MODS[name] = true end
+local function setTog(key, val) pcall(function() if Toggles[key] then Toggles[key]:SetValue(val) end end) end
+local function setOpt(key, val) pcall(function() if Options[key] then Options[key]:SetValue(val) end end) end
+local function applyPreset(map, objective, opts)
+    opts = opts or {}
+    setOpt("D_StartType", "Missions")
+    setOpt("D_MapName", map)
+    task.wait(0.05)
+    setOpt("D_Objective", objective)
+    setOpt("D_Difficulty", "Hardest")
+    setOpt("D_Mods", ALL_MODS)
+    -- movement
+    setOpt("D_MoveMode", opts.move or "Teleport")
+    if opts.height then setOpt("S_Height", opts.height) end
+    setTog("T_Noclip", true)
+    -- combat
+    setTog("T_AutoReload", true)
+    setTog("T_AutoEscape", true)
+    setTog("T_MultiTarget", opts.multi ~= false)
+    -- flow
+    setTog("T_DeleteMap", opts.deleteMap ~= false)
+    setTog("T_SoloOnly", true)
+    setTog("T_AutoRetry", true)
+    setTog("T_AutoRejoin", true)
+    setTog("T_AutoStart", true)
+    setTog("T_AutoFarm", true)
+    Library:Notify("Preset applied: " .. map .. " / " .. objective .. " / Hardest", 5)
+end
+local gPreset = TabFarm:AddLeftGroupbox("Quick Presets (1-click AFK)")
+gPreset:AddButton({ Text = "AFK Farm — Breach (Shiganshina)", Func = function() applyPreset("Shiganshina", "Breach", { height = 170 }) end })
+gPreset:AddButton({ Text = "AFK Farm — Defend (Utgard)",      Func = function() applyPreset("Utgard", "Defend", { height = 170 }) end })
+gPreset:AddButton({ Text = "AFK Farm — Stall (Docks)",        Func = function() applyPreset("Docks", "Stall", { height = 310, multi = false, deleteMap = false }) end })
+gPreset:AddButton({ Text = "Boosted Map Farm (2x)", Func = function()
+    setTog("T_AutoModifiers", true)
+    setTog("T_AutoBoostedMap", true)
+    setTog("T_AutoReload", true); setTog("T_AutoEscape", true); setTog("T_Noclip", true)
+    setTog("T_AutoRetry", true); setTog("T_AutoRejoin", true); setTog("T_AutoFarm", true)
+    Library:Notify("Boosted-map farm armed — will join the 2x map", 5)
+end})
 -- ═══ TAB: AFK ENGINE (everything needed to leave the game running unattended) ═══
 local TabAFK = Window:AddTab("AFK Engine")
 local gStart  = TabAFK:AddLeftGroupbox("Auto Start && Retry")
