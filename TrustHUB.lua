@@ -2160,6 +2160,11 @@ local Options = Library.Options -- was missing: D_MapName callback indexed a nil
                                  -- (including at load, since Default=1 fires the callback),
                                  -- leaving Objective/Mission config stuck — this was why auto-start
                                  -- never actually started a mission.
+local Toggles = Library.Toggles -- SAME class of bug: the config-restore sync and the preset
+                                 -- buttons index Toggles[...]; without this it was a nil global,
+                                 -- which errored at load ("index nil with 'T_Disable3D'") and
+                                 -- killed the ENTIRE script before masterStart — so nothing ran
+                                 -- (no auto-start, no countdown, no farm).
 -- ═══ TAB: FARM (what to farm) ═══
 local TabFarm = Window:AddTab("Farm")
 local gMission = TabFarm:AddLeftGroupbox("Mission Selection")
