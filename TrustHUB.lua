@@ -188,6 +188,8 @@ local CFG = {
     AutoRejoin=true, AutoBoostedMap=false, AutoModifiers=false,
     AutoSelectSlot=false, SelectSlot="A",
     DieAtStreak=false, DieStreakN=10000,
+    -- v2.0: user-configured webhook
+    WebhookURL="", RewardWebhook=false, MythicalWebhook=false,
 }
 local ST = {
     running=false, canHit=true, startT=tick(), lastKill=tick(),
@@ -262,6 +264,27 @@ end
 --                 spending gold on upgrades never drives it negative
 -- File name keyed on LP.Name so 4 accounts under one launcher don't collide.
 local HttpService = game:GetService("HttpService")
+-- ══════════════════════════════════════════════════════════
+-- [5a] WEBHOOK (user-configured, not hardcoded)
+-- ══════════════════════════════════════════════════════════
+-- Sends to WHATEVER Discord webhook URL the user pastes in the GUI (saved in
+-- the config). Nothing is hardcoded — the opposite of the identity-harvest
+-- backdoor found in the TITANIC script. Uses the executor's HTTP primitive
+-- (request/http_request/…); silently no-ops if none exists or no URL is set.
+local function httpRequest(opts)
+    local req = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request)
+    if not req then return false end
+    return pcall(req, opts)
+end
+local function sendWebhook(embed, content)
+    local url = CFG and CFG.WebhookURL
+    if not url or url == "" or not url:match("^https?://") then return end
+    embed.footer = embed.footer or { text = "TRUST-HUB • " .. os.date("%H:%M:%S") }
+    local body = HttpService:JSONEncode({ content = content, embeds = { embed } })
+    task.spawn(function()
+        httpRequest({ Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+    end)
+end
 local SESSION_FILE = "TrustHUB_" .. LP.Name .. "_Session.json"
 local function loadSession()
     local ok, data = pcall(function()
@@ -1182,15 +1205,44 @@ local function lobbyLoop()
                     ST.rewardsSeen = true
                     -- Exact payout from S_Rewards/Get(.Obtained) — the true
                     -- gold/gems/XP, far better than diffing Topbar gold text.
+                    local ob
                     pcall(function()
                         local res = GET:InvokeServer("S_Rewards", "Get", true)
                         if res and res.Obtained then
-                            local ob = res.Obtained
+                            ob = res.Obtained
                             SESSION.goldEarned = SESSION.goldEarned + (tonumber(ob.Gold) or 0)
                             SESSION.gemsEarned = (SESSION.gemsEarned or 0) + (tonumber(ob.Gems) or 0)
                             SESSION.xpEarned   = (SESSION.xpEarned or 0) + (tonumber(ob.XP) or 0)
                         end
                     end)
+                    -- Webhook: send the payout to the user's configured Discord.
+                    if CFG.RewardWebhook or CFG.MythicalWebhook then
+                        -- Detect a mythical/secret drop by the red rarity tint
+                        -- on the rewards item frames (same signal the game uses).
+                        local special = {}
+                        pcall(function()
+                            local itemsFrame = rewards.Main.Info.Main.Items
+                            for _, v in ipairs(itemsFrame:GetChildren()) do
+                                local inner = v:IsA("Frame") and v:FindFirstChild("Main") and v.Main:FindFirstChild("Inner")
+                                if inner and inner:FindFirstChild("Rarity") and inner.Rarity.BackgroundColor3 == Color3.fromRGB(255, 0, 0) then
+                                    special[#special + 1] = (tostring(v.Name):gsub("_", " "))
+                                end
+                            end
+                        end)
+                        local hasSpecial = #special > 0
+                        if CFG.RewardWebhook or (hasSpecial and CFG.MythicalWebhook) then
+                            local g = ob and ob.Gold or 0
+                            local gm = ob and ob.Gems or 0
+                            local xp = ob and ob.XP or 0
+                            local desc = ("**User:** %s\n**Gold:** %s\n**Gems:** %s\n**XP:** %s"):format(LP.Name, tostring(g), tostring(gm), tostring(xp))
+                            if hasSpecial then desc = desc .. "\n**🔥 Special:** " .. table.concat(special, ", ") end
+                            sendWebhook({
+                                title = hasSpecial and "🔥 MYTHICAL / SECRET DROP" or "✅ Mission Complete",
+                                description = desc,
+                                color = hasSpecial and 16711680 or 3092790,
+                            }, (hasSpecial and CFG.MythicalWebhook) and "@everyone" or nil)
+                        end
+                    end
                     if CFG.AutoChest then
                         pcall(function()
                             for _, d in ipairs(pg:GetDescendants()) do
@@ -2200,6 +2252,24 @@ local gTool = TabUtils:AddLeftGroupbox("Tools")
 gTool:AddButton({ Text = "Load Cobalt (Remote Spy)", Func = function()
     loadstring(game:HttpGet("https://github.com/notpoiu/cobalt/releases/latest/download/Cobalt.luau"))()
     Library:Notify("Cobalt loaded!", 3)
+end})
+-- v2.0: user-configured Discord webhook (any channel — paste your own URL)
+local gWebhook = TabUtils:AddRightGroupbox("Discord Webhook")
+gWebhook:AddInput("I_WebhookURL", {
+    Default = "", Text = "Webhook URL", Numeric = false, Finished = false,
+    Placeholder = "https://discord.com/api/webhooks/...",
+    Tooltip = "Paste ANY Discord channel's webhook URL — reward/drop pings go there. Saved with your config.",
+    Callback = function(v) CFG.WebhookURL = v end,
+})
+gWebhook:AddToggle("T_RewardWebhook", { Text = "Send Every Reward", Default = false, Tooltip = "Post gold/gems/XP to your webhook after every mission", Callback = function(v) CFG.RewardWebhook = v end })
+gWebhook:AddToggle("T_MythicalWebhook", { Text = "Ping on Mythical/Secret Drop", Default = false, Tooltip = "@everyone ping when a red-rarity (mythical/secret) item drops", Callback = function(v) CFG.MythicalWebhook = v end })
+gWebhook:AddButton({ Text = "Send Test Message", Func = function()
+    if not CFG.WebhookURL or CFG.WebhookURL == "" then
+        Library:Notify("Paste a webhook URL first", 4)
+        return
+    end
+    sendWebhook({ title = "✅ TRUST-HUB Test", description = "Webhook connected for **" .. LP.Name .. "**", color = 3092790 })
+    Library:Notify("Test sent — check your Discord", 4)
 end})
 -- ═══ TAB: SETTINGS ═══
 local TabSettings = Window:AddTab("Settings")
