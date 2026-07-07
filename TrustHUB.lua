@@ -1631,7 +1631,7 @@ local function buildStatsPanel()
     sg.IgnoreGuiInset = true
     sg.Parent = pg
 
-    local labels = { "Status", "Session", "Kills (mission)", "Missions", "Gold earned", "Gems earned", "Gold/Hour" }
+    local labels = { "Status", "Session", "Kills (mission)", "Missions", "Gold earned", "Gems earned", "XP earned", "Gold/Hour" }
     local TITLE_H, ROW_H = 24, 20
     local bodyH = #labels * ROW_H + 6
     local fullH = TITLE_H + bodyH
@@ -1764,6 +1764,7 @@ track(RunService.Heartbeat:Connect(function()
     -- couldn't tell mission income from spending.
     statsPanel.Rows["Gold earned"].Text = "Gold earned: " .. formatNumber(SESSION.goldEarned)
     statsPanel.Rows["Gems earned"].Text = "Gems earned: " .. formatNumber(SESSION.gemsEarned or 0)
+    statsPanel.Rows["XP earned"].Text = "XP earned: " .. formatNumber(SESSION.xpEarned or 0)
     local perHour = elapsed > 5 and math.floor(SESSION.goldEarned / elapsed * 3600) or 0
     statsPanel.Rows["Gold/Hour"].Text = "Gold/Hour: " .. formatNumber(perHour)
 
@@ -2090,11 +2091,17 @@ end})
 -- ═══ TAB: SETTINGS ═══
 local TabSettings = Window:AddTab("Settings")
 local gHub = TabSettings:AddLeftGroupbox("Hub")
-gHub:AddToggle("T_StatsPanel", { Text = "Show Stats Panel", Default = true, Callback = function(v) CFG.ShowStatsPanel = v end })
-gHub:AddToggle("T_PersistReload", { Text = "Persist Across Teleports", Default = true, Callback = function(v)
+gHub:AddToggle("T_StatsPanel", { Text = "Show Stats Panel", Default = true, Tooltip = "The draggable/minimizable on-screen session panel", Callback = function(v) CFG.ShowStatsPanel = v end })
+gHub:AddToggle("T_PersistReload", { Text = "Persist Across Teleports (Auto Execute)", Default = true, Tooltip = "Re-runs the hub from your GitHub repo on every teleport (auto-updates across all accounts); local copy fallback if offline", Callback = function(v)
     CFG.PersistReload = v
     if v then registerTeleportReload() end -- re-arm immediately instead of waiting for the next load
 end })
+gHub:AddButton({ Text = "Reset Session Stats", Func = function()
+    SESSION.gameCount = 0; SESSION.goldEarned = 0; SESSION.gemsEarned = 0; SESSION.xpEarned = 0
+    SESSION.sessionStart = os.time(); ST.gameCount = 0
+    saveSession(SESSION)
+    Library:Notify("Session stats reset", 3)
+end})
 SaveManager:SetLibrary(Library)
 SaveManager:SetFolder("TrustHUB_" .. LP.Name)
 SaveManager:IgnoreThemeSettings()
