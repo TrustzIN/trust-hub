@@ -184,6 +184,10 @@ local CFG = {
     AutoPrestige=false, PrestigeGoldM=0, PrestigeBoost="Luck Boost",
     AutoEnhance=false, PerkSlot="Body", FoodRarities={},
     AutoClaimAch=false,
+    -- v3.2: multi-account / AFK hardening
+    AutoRejoin=true, AutoBoostedMap=false, AutoModifiers=false,
+    AutoSelectSlot=false, SelectSlot="A",
+    DieAtStreak=false, DieStreakN=10000,
 }
 local ST = {
     running=false, canHit=true, startT=tick(), lastKill=tick(),
@@ -216,6 +220,9 @@ local clearESP
 -- down in [15]) needs to call it on lobby arrival — same forward-declare
 -- reason as Library/clearESP above.
 local upgradeAllGear
+-- farmLoop (defined before [15a2]) calls this each tick — forward-declare so
+-- it binds the real function, not a nil global.
+local checkDieAtStreak
 local function track(c) table.insert(conns, c) end
 local function trackThread(fn)
     local th = task.spawn(fn)
@@ -940,6 +947,7 @@ local function farmLoop()
         local c, hrp = getChar()
         if not hrp then continue end
         if CFG.InjuryRemove then removeInjuries() end
+        if CFG.DieAtStreak then checkDieAtStreak() end
         if isGrabbed() then
             if CFG.AutoEscape then escapeGrab(); processAntiGrab() end
             continue
@@ -1095,6 +1103,10 @@ local function lobbyLoop()
         -- getMaxClearableDiffIdx() call below picks a difficulty from it.
         if isLobby and not ST.wasInLobby and CFG.AutoUpGear then
             task.spawn(upgradeAllGear)
+        end
+        -- Multi-account boot: pick a slot if we joined without one.
+        if isLobby and CFG.AutoSelectSlot and not LP:GetAttribute("Slot") then
+            task.spawn(doAutoSelectSlot)
         end
         ST.wasInLobby = isLobby
         if not isLobby then
@@ -1330,13 +1342,33 @@ end
 -- ══════════════════════════════════════════════════════════
 -- [15a] LOBBY AUTOMATION (v3.2 — prestige / perk enhance / achievements)
 -- ══════════════════════════════════════════════════════════
--- Account-wide data (Slots/Perks/Currency) for lobby features. Returns nil if
--- the server doesn't hand it over (it's flaky in the lobby) — callers no-op.
+-- Account-wide data (Slots/Perks/Currency) for lobby features.
+-- Confirmed live: on Xeno the "Functions"/"Settings"/"Get" remote returns nil
+-- (the real account data lives in the character Actor's Cache.Data, a parallel
+-- Luau VM Xeno can't reach — no getactors). So we try, in order:
+--   1) the remote (works on some executors),
+--   2) getsenv() on the Actor Host script (works where getsenv crosses the
+--      Actor boundary, e.g. Real),
+--   3) getactors() + each actor's env (best-effort),
+-- and return nil if none work — callers no-op gracefully. This is why Auto
+-- Enhance needs a fuller executor; Auto Prestige avoids it by reading Topbar.
 local function getAccountData()
-    for _ = 1, 3 do
-        local ok, r = pcall(function() return GET:InvokeServer("Functions", "Settings", "Get") end)
-        if ok and type(r) == "table" and r.Slots then return r end
-        task.wait(0.4)
+    local ok, r = pcall(function() return GET:InvokeServer("Functions", "Settings", "Get") end)
+    if ok and type(r) == "table" and r.Slots then return r end
+    if type(getsenv) == "function" then
+        local host
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d.Name == "Host" and d:IsA("LocalScript") then host = d break end
+        end
+        if host then
+            local ok2, env = pcall(getsenv, host)
+            if ok2 and type(env) == "table" then
+                local cache = rawget(env, "Cache") or env.Cache
+                if type(cache) == "table" and type(cache.Data) == "table" and cache.Data.Slots then
+                    return cache.Data
+                end
+            end
+        end
     end
     return nil
 end
@@ -1359,15 +1391,16 @@ local PRESTIGE_TALENTS = {
     "Gold Boost","Furyforge","Quakestrike","Assassin","Amputation","Steel Frame","Resilience","Vengeflare",
     "Flashstep","Omnirange","Tactician","Gambler","Overslash","Afterimages","Necromantic","Thanatophobia","Apotheosis","Bloodthief",
 }
--- One prestige attempt: prestige only once gold clears the configured
--- threshold. Tries each talent until the server accepts one.
+-- One prestige attempt. Gold threshold is read from the Topbar (readGold),
+-- NOT the account remote — that remote returns nil on Xeno (account data
+-- lives in the Actor VM we can't reach). SAFETY: a threshold of 0 means
+-- "disabled" — otherwise enabling this with the default would prestige
+-- (reset the account) immediately. The server also validates eligibility,
+-- so a call below the real requirement just gets rejected.
 local function doAutoPrestige()
-    local data = getAccountData()
-    local slot = LP:GetAttribute("Slot")
-    local sd = slot and data and data.Slots and data.Slots[slot]
-    if not sd or not sd.Currency then return end
-    local gold = tonumber(sd.Currency.Gold) or 0
-    if gold < (CFG.PrestigeGoldM * 1e6) then return end
+    if CFG.PrestigeGoldM <= 0 then return end
+    local gold = readGold()
+    if not gold or gold < (CFG.PrestigeGoldM * 1e6) then return end
     for _, talent in ipairs(PRESTIGE_TALENTS) do
         local ok, res = pcall(function()
             return GET:InvokeServer("S_Equipment", "Prestige", { Boosts = CFG.PrestigeBoost, Talents = talent })
@@ -1414,6 +1447,118 @@ local function doClaimAchievements()
         if ok and res ~= nil then claimed = true end
     end
     if claimed and Library then Library:Notify("Claimed achievements", 3) end
+end
+-- ══════════════════════════════════════════════════════════
+-- [15a2] MULTI-ACCOUNT / AFK HARDENING (v3.2)
+-- ══════════════════════════════════════════════════════════
+-- Auto-select a slot when joining with none (needed for hands-off multi-acc
+-- boot). Fires the same Functions/Select the slot UI does, then bounces to
+-- the lobby so the account is ready to farm.
+local function doAutoSelectSlot()
+    if LP:GetAttribute("Slot") then return end
+    local letter = tostring(CFG.SelectSlot):sub(-1)
+    for _ = 1, 8 do
+        if LP:GetAttribute("Slot") then break end
+        pcall(function() GET:InvokeServer("Functions", "Select", letter) end)
+        task.wait(1)
+    end
+    if LP:GetAttribute("Slot") then
+        pcall(function() GET:InvokeServer("Functions", "Teleport", "Lobby") end)
+    end
+end
+-- Suicide at a streak threshold (some farms want to reset the streak for
+-- reward pacing). Reads the real LP "Streak" attribute.
+checkDieAtStreak = function()
+    if not CFG.DieAtStreak then return end
+    local streak = LP:GetAttribute("Streak") or 0
+    if streak >= CFG.DieStreakN then
+        local c = getChar()
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if hum then hum.Health = 0 end
+    end
+end
+-- Auto-rejoin on a crashed/stuck mission: if BOTH Titans and Unclimbable are
+-- missing for two consecutive ~10s checks while farming, the mission has
+-- desynced/crashed — teleport back through the lobby to recover. This is the
+-- single biggest reliability win for unattended multi-account farming (a
+-- crashed client otherwise sits dead forever). Ported from the TITANIC hub.
+local function crashRejoinLoop()
+    while ST.running do
+        task.wait(10)
+        if not CFG.AutoRejoin or isInLobby() or not CFG.AutoFarm then continue end
+        local titans = workspace:FindFirstChild("Titans")
+        local unclimb = workspace:FindFirstChild("Unclimbable")
+        if not titans and not unclimb then
+            task.wait(10)
+            if isInLobby() then continue end
+            titans = workspace:FindFirstChild("Titans")
+            unclimb = workspace:FindFirstChild("Unclimbable")
+            if not titans and not unclimb then
+                if Library then Library:Notify("Crash detected — rejoining...", 5) end
+                pcall(function() GET:InvokeServer("Functions", "Teleport", "Lobby") end)
+                task.wait(0.5)
+                pcall(function() TPS:Teleport(14916516914, LP) end)
+            end
+        end
+    end
+end
+-- Auto-join the currently boosted map (2x rewards). In the lobby: read the
+-- server's Boosted_Map attribute, leave any pending mission, create the
+-- boosted map at the hardest difficulty that starts, optionally apply all
+-- modifiers, and start it. In a mission: if the boost changed to a different
+-- map, bail back to the lobby to re-pick. Ported from the TITANIC hub.
+local BOOST_MODS = {"No Perks","No Skills","No Memories","Nightmare","Oddball","Injury Prone","Chronic Injuries","Fog","Glass Cannon","Time Trial"}
+local function boostedMapLoop()
+    local lastBoost = nil
+    while ST.running do
+        task.wait(5)
+        if not CFG.AutoBoostedMap then lastBoost = nil continue end
+        local boosted = workspace:GetAttribute("Boosted_Map")
+        if not isInLobby() then
+            -- mid-mission: if the boost moved to another map, return to re-pick
+            if boosted and boosted ~= "" and boosted ~= lastBoost then
+                pcall(function() GET:InvokeServer("Functions", "Teleport", "Lobby") end)
+                task.wait(0.5)
+                pcall(function() TPS:Teleport(14916516914, LP) end)
+                lastBoost = nil
+                task.wait(5)
+            end
+            continue
+        end
+        if boosted and boosted ~= "" and boosted ~= lastBoost then
+            lastBoost = boosted
+            if Library then Library:Notify("Boosted map: " .. boosted .. " — joining", 4) end
+            pcall(function()
+                for _, m in ipairs(RS.Missions:GetChildren()) do
+                    if m:FindFirstChild("Leader") and m.Leader.Value == LP.Name then
+                        GET:InvokeServer("S_Missions", "Leave")
+                    end
+                end
+            end)
+            task.wait(1)
+            local created = false
+            for _, diff in ipairs({"Aberrant","Severe","Hard","Normal"}) do
+                if created then break end
+                pcall(function()
+                    GET:InvokeServer("S_Missions", "Create", { Difficulty = diff, Type = "Missions", Name = boosted, Objective = "Skirmish" })
+                end)
+                task.wait(0.5)
+                for _, m in ipairs(RS.Missions:GetChildren()) do
+                    if m:FindFirstChild("Leader") and m.Leader.Value == LP.Name then created = true break end
+                end
+            end
+            if created then
+                if CFG.AutoModifiers then
+                    for _, mod in ipairs(BOOST_MODS) do
+                        pcall(function() GET:InvokeServer("S_Missions", "Modify", mod) end)
+                        task.wait(0.05)
+                    end
+                end
+                task.wait(0.5)
+                pcall(function() GET:InvokeServer("S_Missions", "Start") end)
+            end
+        end
+    end
 end
 local function upgradeLoop()
     local lastAch = 0
@@ -1740,6 +1885,8 @@ local function masterStart()
     trackThread(upgradeLoop)
     trackThread(auxLoop) -- ESP + cutscene skip merged
     trackThread(reloadLoop) -- blade durability + set refill
+    trackThread(crashRejoinLoop) -- multi-account: recover a crashed mission
+    trackThread(boostedMapLoop) -- auto-join the 2x boosted map
     -- Ban-attribute clearing already happens reactively via the
     -- AttributeChanged connection set up in [2]; a second 0.5s polling loop
     -- doing the exact same clear on the exact same attribute list was pure
@@ -1847,6 +1994,17 @@ gFlow:AddButton({ Text = "Check Ban Status", Func = function()
         Library:Notify("No shadow ban detected", 5)
     end
 end})
+-- v3.2: multi-account hardening
+local gMulti = TabAFK:AddRightGroupbox("Multi-Account")
+gMulti:AddToggle("T_AutoRejoin", { Text = "Auto Rejoin on Crash", Default = true, Tooltip = "Detects a crashed/stuck mission and teleports back through the lobby", Callback = function(v) CFG.AutoRejoin = v end })
+gMulti:AddToggle("T_AutoSelectSlot", { Text = "Auto Select Slot", Default = false, Tooltip = "Picks a slot automatically when joining with none (hands-off boot)", Callback = function(v) CFG.AutoSelectSlot = v end })
+gMulti:AddDropdown("D_SelectSlot", { Text = "Slot", Values = {"A","B","C"}, Default = 1, Callback = function(v) CFG.SelectSlot = v end })
+gMulti:AddDivider()
+gMulti:AddToggle("T_AutoBoostedMap", { Text = "Auto Join Boosted Map (2x)", Default = false, Tooltip = "Auto-creates and starts whichever map currently has the 2x reward boost", Callback = function(v) CFG.AutoBoostedMap = v end })
+gMulti:AddToggle("T_AutoModifiers", { Text = "Apply All Modifiers on Boosted", Default = false, Callback = function(v) CFG.AutoModifiers = v end })
+gMulti:AddDivider()
+gMulti:AddToggle("T_DieAtStreak", { Text = "Die at Streak", Default = false, Callback = function(v) CFG.DieAtStreak = v end })
+gMulti:AddSlider("S_DieStreak", { Text = "Die at streak >=", Default = 10000, Min = 10, Max = 100000, Rounding = 0, Callback = function(v) CFG.DieStreakN = v end })
 local gAfkUp = TabAFK:AddLeftGroupbox("Progression While AFK")
 gAfkUp:AddToggle("T_AutoUpGear", { Text = "Auto Upgrade Gear (on lobby arrival)", Default = false, Callback = function(v) CFG.AutoUpGear = v end })
 gAfkUp:AddToggle("T_AutoSP",   { Text = "Auto Spend SP",            Default = false, Callback = function(v) CFG.AutoSpendSP = v end })
@@ -1870,7 +2028,7 @@ gLobby:AddToggle("T_AutoPrestige", { Text = "Auto Prestige", Default = false, Ca
 gLobby:AddSlider("S_PrestigeGold", { Text = "Prestige at Gold (millions)", Default = 0, Min = 0, Max = 100, Rounding = 0, Callback = function(v) CFG.PrestigeGoldM = v end })
 gLobby:AddDropdown("D_PrestigeBoost", { Text = "Prestige Boost", Values = {"Luck Boost","EXP Boost","Gold Boost"}, Default = 1, Callback = function(v) CFG.PrestigeBoost = v end })
 gLobby:AddDivider()
-gLobby:AddToggle("T_AutoEnhance", { Text = "Auto Enhance Perk", Default = false, Callback = function(v) CFG.AutoEnhance = v end })
+gLobby:AddToggle("T_AutoEnhance", { Text = "Auto Enhance Perk (needs Volt/better exec)", Default = false, Callback = function(v) CFG.AutoEnhance = v end })
 gLobby:AddDropdown("D_PerkSlot", { Text = "Perk Slot to Enhance", Values = {"Defense","Support","Family","Extra","Offense","Body"}, Default = 6, Callback = function(v) CFG.PerkSlot = v end })
 gLobby:AddDropdown("D_FoodRarities", { Text = "Food Perk Rarities", Values = {"Common","Rare","Epic","Legendary"}, Default = {}, Multi = true, Callback = function(v)
     local r = {}
